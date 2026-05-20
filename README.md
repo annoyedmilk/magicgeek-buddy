@@ -86,10 +86,15 @@ bash -c "source /opt/esp-idf/export.sh && idf.py build"
 
 The build produces `build/ClaudeBuddy.bin`.
 
-You can also grab a prebuilt `ClaudeBuddy.bin` from the
-[Releases page](../../releases) (built by GitHub Actions from the
-tagged commit). Then either flash it manually the first time, or
-push it via OTA if the device is already running a previous version.
+You can also grab a prebuilt `ClaudeBuddy.bin` without setting up
+the toolchain:
+
+* Latest stable build (always points at the newest release):
+  [`ClaudeBuddy.bin`](https://github.com/annoyedmilk/magicgeek-buddy/releases/latest/download/ClaudeBuddy.bin)
+* All releases with notes: [Releases page](../../releases)
+
+Either flash it manually the first time, or push it via OTA if the
+device is already running a previous version.
 
 ### First flash (GPIO0 + RST dance)
 
