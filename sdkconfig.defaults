@@ -1,0 +1,46 @@
+# Claude Buddy: SDK defaults (ESP-IDF v6.0.1, ESP32-D0WD-V3, 16MB flash).
+
+# Flash (GeekMagic Pro: 16MB GigaDevice GD25Q128, mfr 0x68 dev 0x4018).
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# Rollback recovers from a bad OTA image on the next boot.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Custom partition table: OTA dual-slot + NVS only (no SPIFFS).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# WiFi (background STA for the OTA HTTP server, captive portal fallback).
+CONFIG_ESP_WIFI_ENABLED=y
+
+# LWIP / HTTP server (captive portal + OTA upload).
+CONFIG_LWIP_MAX_SOCKETS=10
+CONFIG_LWIP_SO_RCVBUF=y
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512
+
+# BLE: NimBLE host, Nordic UART Service to Claude desktop. NimBLE is
+# lighter on RAM than Bluedroid, which matters alongside the 58KB
+# framebuffer band.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+# LE Secure Connections + bonding (REFERENCE.md requires encrypted NUS).
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=y
+CONFIG_BT_NIMBLE_SM_LEGACY=y
+CONFIG_BT_NIMBLE_SM_SC=y
+# Persist bonds (LTKs, IRKs) in NVS so reconnects skip the passkey prompt.
+# Without this, every reboot forces a fresh pair on the desktop side.
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+# DisplayOnly IO + show passkey: device picks the code, central enters it.
+CONFIG_BT_NIMBLE_SM_SC_DEBUG_KEYS=n
+# Up to ~180 byte notifies (chunked TX in ble_nus.c assumes this).
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256
+
+# Main task stack: framebuffer init + JSON parsing need headroom.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

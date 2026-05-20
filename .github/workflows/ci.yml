@@ -1,0 +1,40 @@
+name: CI build
+
+# Runs on every push and every pull request. Compiles the firmware
+# with ESP-IDF v6.0 in the official Espressif container and uploads
+# the resulting `ClaudeBuddy.bin` as a workflow artifact so reviewers
+# can sideload a build directly from the run page.
+
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:release-v6.0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py build
+          ls -la build/ClaudeBuddy.bin
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeBuddy-bin-${{ github.sha }}
+          path: build/ClaudeBuddy.bin
+          if-no-files-found: error
+          retention-days: 14

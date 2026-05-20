@@ -1,0 +1,34 @@
+# ESP-IDF build artifacts
+build/
+managed_components/
+
+# sdkconfig is generated from sdkconfig.defaults on first build.
+# Keep .defaults in git; do not check in the expanded sdkconfig.
+sdkconfig
+sdkconfig.old
+
+# IDF component manager lock file: COMMITTED so GH Actions builds the
+# same component versions you tested locally. Regenerate by deleting
+# the file and running `idf.py reconfigure`.
+# (dependencies.lock intentionally tracked)
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python venv / caches sometimes left behind by idf.py
+__pycache__/
+*.pyc
+.cache/
+
+# Local Claude Code state
+.claude/
+
+# Local secrets (none by default; keep the door closed)
+*.local
+.env

@@ -1,0 +1,6 @@
+## IDF Component Manager Manifest
+dependencies:
+  idf:
+    version: '>=6.0.0'
+  # JSON parsing for the BLE bridge protocol (heartbeats, acks, folder push).
+  espressif/cjson: '*'

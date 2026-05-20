@@ -1,0 +1,52 @@
+name: Build firmware and publish release
+
+# Tag-triggered release. Push a SemVer-style tag (e.g. `v1.0.0`) and
+# this workflow builds the firmware with ESP-IDF v6.0.1 and attaches
+# `ClaudeBuddy.bin` to a new GitHub Release.
+#
+# To cut a release:
+#   git tag v1.0.0
+#   git push origin v1.0.0
+#
+# The `workflow_dispatch` trigger also lets you build a one-off binary
+# from the Actions tab without tagging (artifact only, no Release).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required to create the Release and upload the bin
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:release-v6.0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py build
+          ls -la build/ClaudeBuddy.bin
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeBuddy-bin
+          path: build/ClaudeBuddy.bin
+          if-no-files-found: error
+
+      - name: Publish to a GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/ClaudeBuddy.bin
+          generate_release_notes: true
