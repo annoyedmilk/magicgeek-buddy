@@ -420,6 +420,18 @@ void ble_clear_bonds(void)
     ESP_LOGI(TAG, "[ble] cleared bonds (rc=%d)", rc);
 }
 
+bool ble_disconnect(void)
+{
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) return false;
+    // BLE_ERR_REM_USER_CONN_TERM (0x13) = "remote user terminated" - the
+    // standard reason code for an app-initiated disconnect. The GAP
+    // disconnect handler will fire and start_advertising() will be
+    // called from there, so the link comes back up cleanly.
+    int rc = ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    ESP_LOGI(TAG, "[ble] forced disconnect requested (rc=%d)", rc);
+    return rc == 0;
+}
+
 size_t ble_available(void)
 {
     return (rx_head + RX_CAP - rx_tail) % RX_CAP;

@@ -471,7 +471,20 @@ static void bridge_task(void *arg)
             ESP_LOGW(TAG, "heartbeat stale (>30s) - marked disconnected");
         }
         xSemaphoreGive(g_state_mux);
-        if (just_went_stale) translog_append("stale", "");
+        if (just_went_stale) {
+            translog_append("stale", "");
+            // Recovery: if BLE is up but heartbeats stopped, the Mac's
+            // CoreBluetooth client has desynchronized from the Claude
+            // desktop app's view of the link (observed: app shows
+            // "Disconnected" but OS still has the GATT handle, Connect
+            // button does nothing). Force-tearing down the link from
+            // our side gets both stacks to resync from scratch.
+            if (ble_connected()) {
+                ESP_LOGW(TAG, "stale + link still up - forcing BLE disconnect");
+                translog_append("force_disc", "");
+                ble_disconnect();
+            }
+        }
 
         vTaskDelay(pdMS_TO_TICKS(50));   // 20Hz drain - plenty for NUS bandwidth
     }

@@ -49,3 +49,12 @@ int ble_read(void);
 // Notify-write to the TX char. Chunks the payload to fit (MTU - 3); waits
 // briefly between chunks for the stack to drain. Returns bytes accepted.
 size_t ble_write(const uint8_t *data, size_t len);
+
+// Force-terminate the current BLE connection (if any). The disconnect
+// handler will fire and re-advertise. Used by the bridge as a recovery
+// hook when the link is up at the LL layer but heartbeats have stopped
+// flowing - the Mac's CoreBluetooth client occasionally desynchronizes
+// from the Claude desktop app's view of the link, and only a full
+// teardown gets both sides agreeing again.
+// Returns true if a disconnect was initiated, false if no link was up.
+bool ble_disconnect(void);
