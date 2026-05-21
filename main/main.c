@@ -27,6 +27,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
+#include "esp_http_server.h"
 
 #include "display.h"
 #include "gfx.h"
@@ -40,6 +41,9 @@
 #include "buddy.h"
 #include "ui.h"
 #include "ota_server.h"
+#include "app_version.h"
+#include "debug_log.h"
+#include "translog.h"
 
 static const char *TAG = "buddy";
 
@@ -51,14 +55,22 @@ static const char *TAG = "buddy";
 static uint8_t  g_transcript_scroll = 0;
 static uint16_t g_last_line_gen     = 0;
 
-// Backlight idle-fade. Updated from any touch event or whenever an
-// interesting state change happens in buddy_task; consumed by the
-// dim/fade logic at the bottom of the same task. Volatile because the
-// touch ISR-adjacent task writes while buddy_task reads.
-static volatile uint32_t g_last_activity_ms = 0;
+// Backlight idle-fade. Two-tier:
+//   Tier 1 (dim):  no touch AND no new transcript content for 15 min →
+//                  drop to 30%. Catches "peer alive but nothing's
+//                  happening" - the Claude desktop stays open all day.
+//   Tier 2 (off):  P_SLEEP (no peer at all) AND no touch for 5 min →
+//                  fade to 0. Burn-in protection on the IPS panel.
+// Both timers reset on touch (via on_touch) and on a line_gen bump
+// (heartbeat carried a new transcript line). The DIM timer is reset
+// only when the peer is alive; SLEEP doesn't keep extending it.
+static volatile uint32_t g_last_activity_ms = 0;  // tier-2 (SLEEP) gate
+static volatile uint32_t g_last_dim_reset_ms = 0; // tier-1 (idle peer) gate
 #define BL_IDLE_FADE_AFTER_MS  (5 * 60 * 1000)   // 5 minutes of P_SLEEP
+#define BL_IDLE_DIM_AFTER_MS   (15 * 60 * 1000)  // 15 min idle-with-peer
 #define BL_IDLE_FADE_DURATION_MS 2000            // 2-second envelope
 #define BL_DIM_PERCENT          0                // fade-to-off target
+#define BL_HALF_DIM_PERCENT     30               // tier-1 target
 
 // ─────────────────────────────────────────────────────────────────────
 // Touch routing. Priority (highest first):
@@ -72,10 +84,12 @@ static volatile uint32_t g_last_activity_ms = 0;
 // ─────────────────────────────────────────────────────────────────────
 static void on_touch(touch_event_t ev)
 {
-    // Any touch resets the idle timer and snaps the backlight back on.
+    // Any touch resets BOTH idle timers and snaps the backlight back on.
     // Even gestures the UI consumes count as activity - the user is
     // clearly looking at the screen.
-    g_last_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    g_last_activity_ms = now;
+    g_last_dim_reset_ms = now;
     display_set_backlight(100);
 
     switch (ev) {
@@ -171,16 +185,27 @@ static void compose_prompt(void *ctx)
     gfx_text_center(98,  l1, COLOR_CLAUDE_DIM, COLOR_CLAUDE_BG, 1);
     gfx_text_center(112, l2, COLOR_CLAUDE_DIM, COLOR_CLAUDE_BG, 1);
 
-    // Action buttons
-    gfx_fill_rect(8,  170, 104, 50, COLOR_GREEN);
-    gfx_text_center(180, "TAP",     COLOR_CLAUDE_BG, COLOR_GREEN, 2);
-    gfx_text_center(202, "approve", COLOR_CLAUDE_BG, COLOR_GREEN, 1);
+    // Action buttons. Each rect is 104 px wide. gfx_text_center spans
+    // the full 240 px screen, so naive use lands all four labels in
+    // the dark gap between buttons. Compute per-button centers manually.
+    //   green:  x=8..112,  center=60
+    //   red:    x=128..232, center=180
+    // 8x8 glyph cell, so per-glyph width = 8 * scale.
+    const int GBTN_CX = 60, RBTN_CX = 180;
+    #define BTN_LABEL(cx, y, s, scale, fg, bg) do { \
+        int _w = (int)strlen(s) * 8 * (scale); \
+        gfx_text((cx) - _w / 2, (y), (s), (fg), (bg), (scale)); \
+    } while (0)
+
+    gfx_fill_rect(8, 170, 104, 50, COLOR_GREEN);
+    BTN_LABEL(GBTN_CX, 180, "TAP",     2, COLOR_CLAUDE_BG, COLOR_GREEN);
+    BTN_LABEL(GBTN_CX, 202, "approve", 1, COLOR_CLAUDE_BG, COLOR_GREEN);
 
     gfx_fill_rect(128, 170, 104, 50, COLOR_RED);
-    gfx_text_center(180, "DOUBLE",  COLOR_CLAUDE_PAPER, COLOR_RED, 2);
-    // Override the X for "deny" so it sits over the right half - the
-    // helper centers across full width, which would land it on the gap.
-    gfx_text_center(202, "deny",    COLOR_CLAUDE_PAPER, COLOR_RED, 1);
+    BTN_LABEL(RBTN_CX, 180, "DOUBLE",  2, COLOR_CLAUDE_PAPER, COLOR_RED);
+    BTN_LABEL(RBTN_CX, 202, "deny",    1, COLOR_CLAUDE_PAPER, COLOR_RED);
+
+    #undef BTN_LABEL
     ui_compose_overlay();
 }
 
@@ -469,9 +494,10 @@ static void buddy_task(void *arg)
     // that threshold AND WiFi is up (proof the network stack works).
     uint32_t boot_t0_ms = (uint32_t)(esp_timer_get_time() / 1000);
     bool     marked_valid = false;
-    // Seed the idle-fade clock so we don't dim during the first 5 min of
+    // Seed both idle clocks so we don't dim during the first 5/15 min of
     // uptime (the user just plugged it in and is watching it).
     g_last_activity_ms = boot_t0_ms;
+    g_last_dim_reset_ms = boot_t0_ms;
 
     screen_t last = (screen_t)-1;
     uint32_t last_pk = 0;
@@ -602,14 +628,20 @@ static void buddy_task(void *arg)
             last_prompt_id[sizeof(last_prompt_id) - 1] = 0;
         }
 
-        // One-shot OTA mount: as soon as the shared httpd exists,
-        // attach /ota onto it. Works in both AP (captive portal still
-        // running) and STA mode - recovery via captive AP if a flashed
-        // build never gets STA online.
+        // One-shot OTA + /debug mount: as soon as the shared httpd
+        // exists, attach the routes. Works in both AP (captive portal
+        // still running) and STA mode - recovery via captive AP if a
+        // flashed build never gets STA online.
         if (!ota_mounted && wifi_manager_get_httpd() != NULL) {
             if (ota_start() == ESP_OK) {
                 ota_mounted = true;
                 ESP_LOGI(TAG, "OTA endpoint ready: http://<device-ip>/ota");
+                if (debug_log_register_routes(
+                        (httpd_handle_t)wifi_manager_get_httpd()) == ESP_OK) {
+                    ESP_LOGI(TAG, "debug endpoint ready: http://<device-ip>/debug");
+                } else {
+                    ESP_LOGW(TAG, "debug endpoint registration failed");
+                }
             }
         }
 
@@ -625,33 +657,57 @@ static void buddy_task(void *arg)
 
         // ─── Idle backlight fade (burn-in protection) ─────────────────
         // The ST7789V IPS panel is prone to image retention on long
-        // static fields. When the device sits in P_SLEEP (no desktop
-        // peer, no UI activity) for > BL_IDLE_FADE_AFTER_MS, fade the
-        // backlight to 0 over BL_IDLE_FADE_DURATION_MS. Any touch or
-        // persona transition out of SLEEP snaps us back to 100% via
-        // on_touch() or the activity update below.
+        // static fields. Two tiers:
+        //   tier 1: peer alive but nothing happening for 15 min → 30%
+        //   tier 2: P_SLEEP (no peer) for 5 min → 0%
+        // Both reset on touch (via on_touch) and on a new transcript
+        // line (line_gen bump). Tier 2 also resets on any non-SLEEP
+        // persona state since "running sessions" is real activity.
         {
-            // Treat "interesting" persona states and active overlays as
-            // activity so the dim timer only counts true idle time.
+            static uint16_t last_bl_line_gen = 0;
             bool active_ui   = (ui_get_state() != UI_NORMAL);
             bool peer_alive  = (scr != SCR_PERSONA) || (persona != P_SLEEP);
+            bool new_content = (s.line_gen != last_bl_line_gen);
+            last_bl_line_gen = s.line_gen;
+
+            // Tier 2 (SLEEP→off): resets on any UI activity OR any
+            // non-SLEEP persona. Unchanged semantics from v0.2.0.
             if (active_ui || peer_alive) {
                 g_last_activity_ms = now_ms;
             }
-            uint32_t idle_for = now_ms - g_last_activity_ms;
+            // Tier 1 (idle-with-peer→dim): resets only on REAL activity
+            // - new transcript content, touch, or active overlay.
+            // Steady-state "BUSY but the same heartbeat" doesn't count.
+            if (active_ui || new_content) {
+                g_last_dim_reset_ms = now_ms;
+            }
+
+            uint32_t idle_for_fade = now_ms - g_last_activity_ms;
+            uint32_t idle_for_dim  = now_ms - g_last_dim_reset_ms;
             uint8_t  target;
-            if (idle_for < BL_IDLE_FADE_AFTER_MS) {
-                target = 100;
-            } else {
-                uint32_t into_fade = idle_for - BL_IDLE_FADE_AFTER_MS;
+
+            if (idle_for_fade >= BL_IDLE_FADE_AFTER_MS) {
+                // Tier 2 wins: ramp 100 → BL_DIM_PERCENT (off).
+                uint32_t into_fade = idle_for_fade - BL_IDLE_FADE_AFTER_MS;
                 if (into_fade >= BL_IDLE_FADE_DURATION_MS) {
                     target = BL_DIM_PERCENT;
                 } else {
-                    // Linear ramp from 100 → BL_DIM_PERCENT.
                     uint32_t span = 100u - BL_DIM_PERCENT;
                     uint32_t drop = (span * into_fade) / BL_IDLE_FADE_DURATION_MS;
                     target = (uint8_t)(100u - drop);
                 }
+            } else if (idle_for_dim >= BL_IDLE_DIM_AFTER_MS) {
+                // Tier 1: ramp 100 → BL_HALF_DIM_PERCENT (30%).
+                uint32_t into_dim = idle_for_dim - BL_IDLE_DIM_AFTER_MS;
+                if (into_dim >= BL_IDLE_FADE_DURATION_MS) {
+                    target = BL_HALF_DIM_PERCENT;
+                } else {
+                    uint32_t span = 100u - BL_HALF_DIM_PERCENT;
+                    uint32_t drop = (span * into_dim) / BL_IDLE_FADE_DURATION_MS;
+                    target = (uint8_t)(100u - drop);
+                }
+            } else {
+                target = 100;
             }
             static uint8_t s_last_target = 100;
             if (target != s_last_target) {
@@ -669,9 +725,14 @@ static void buddy_task(void *arg)
 
 void app_main(void)
 {
-    // Build fingerprint - bump the tag whenever a fix is OTA'd so we can
-    // tell from the boot log which build is actually running on the device.
-    ESP_LOGI(TAG, "Claude Buddy boot");
+    // Build fingerprint - bumped on each OTA so we can tell from the
+    // boot log (or /debug after WiFi is up) which build is running.
+    ESP_LOGI(TAG, "Claude Buddy boot, firmware %s", APP_VERSION);
+
+    // Start the in-RAM log ring BEFORE everything else so we capture
+    // the boot-log lines that follow. ESP_LOGI still goes to UART; the
+    // ring just tees it. Safe to call before NVS/WiFi/etc.
+    debug_log_init();
 
     ESP_ERROR_CHECK(storage_init_nvs());
     stats_load();

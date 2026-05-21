@@ -1,9 +1,15 @@
 # Name,    Type, SubType, Offset,   Size,     Flags
-# OTA dual-slot (rollback) + NVS. 16MB flash. Each OTA slot 1.875MB.
-# The remaining ~12MB at 0x3E0000 is left unused; reclaim it here if you
-# add a future feature that needs flash storage (SPIFFS / FAT / fatfs).
+# OTA dual-slot (rollback) + NVS + small SPIFFS for transcript log.
+# 16MB flash total. Each OTA slot is 1.875MB. We only claim 256KB for
+# SPIFFS even though there's 12MB unused above ota_1 - the bottleneck
+# is MCU RAM (SPIFFS index cache scales with partition size, not the
+# actual log file). 256KB index + ~10KB RAM gives us ~44 min of rolling
+# heartbeat history (translog.c rotates between two 100KB segments),
+# which is enough for the failure modes /debug exists to catch.
+# Reclaim the trailing space if a future feature genuinely needs flash.
 nvs,       data, nvs,     0x9000,   0x6000,
 phy_init,  data, phy,     0xf000,   0x1000,
 otadata,   data, ota,     0x15000,  0x2000,
 ota_0,     app,  ota_0,   0x20000,  0x1E0000,
 ota_1,     app,  ota_1,   0x200000, 0x1E0000,
+storage,   data, spiffs,  0x3E0000, 0x40000,

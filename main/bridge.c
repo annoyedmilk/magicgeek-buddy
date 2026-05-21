@@ -13,6 +13,7 @@
 #include "ble_nus.h"
 #include "storage.h"
 #include "stats.h"
+#include "translog.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,8 +107,10 @@ static int json_int(const cJSON *obj, const char *key, int def)
 static void send_line(const char *json)
 {
     size_t n = strlen(json);
-    // Temporary: log every TX line so xfer ack failures are diagnosable.
-    ESP_LOGI(TAG, "tx: %.120s%s", json, n > 120 ? "..." : "");
+    // TX trace at DEBUG. Xfer was confirmed end-to-end in v0.1.0 ↔ v0.2.0
+    // testing; the line is kept (gated by LOG_LOCAL_LEVEL) so future
+    // regressions can be diagnosed without recompiling.
+    ESP_LOGD(TAG, "tx: %.120s%s", json, n > 120 ? "..." : "");
     ble_write((const uint8_t *)json, n);
     ble_write((const uint8_t *)"\n", 1);
 }
@@ -181,6 +184,17 @@ static void apply_heartbeat(const cJSON *doc)
             strncpy(g_last_seen_prompt_id, g_state.prompt_id,
                     sizeof(g_last_seen_prompt_id) - 1);
             g_last_seen_prompt_id[sizeof(g_last_seen_prompt_id) - 1] = 0;
+            // Log on the prompt-id transition only (not every heartbeat
+            // that keeps carrying the same waiting prompt). Tool name
+            // commas would corrupt CSV; replace before formatting.
+            char tool[48];
+            strncpy(tool, g_state.prompt_tool[0] ? g_state.prompt_tool : "?",
+                    sizeof(tool) - 1);
+            tool[sizeof(tool) - 1] = 0;
+            for (char *c = tool; *c; c++) if (*c == ',') *c = ' ';
+            char ex[80];
+            snprintf(ex, sizeof(ex), ",,,,%s", tool);
+            translog_append("prompt", ex);
         }
     } else {
         g_state.prompt_id[0] = g_state.prompt_tool[0] = g_state.prompt_hint[0] = 0;
@@ -188,9 +202,43 @@ static void apply_heartbeat(const cJSON *doc)
         g_prompt_arrived_ms = 0;
     }
 
+    bool was_disconnected = !g_state.connected;
     g_state.last_updated_ms = millis();
     g_state.connected = true;
+
+    // Snapshot fields needed for the translog row before releasing the
+    // mutex - keeps the file write off the critical section.
+    uint8_t  tl_total = g_state.sessions_total;
+    uint8_t  tl_run   = g_state.sessions_running;
+    uint8_t  tl_wait  = g_state.sessions_waiting;
+    uint32_t tl_tok   = g_state.tokens_today;
+    char     tl_prompt[40]; tl_prompt[0] = 0;
+    if (g_state.prompt_id[0]) {
+        strncpy(tl_prompt, g_state.prompt_tool, sizeof(tl_prompt) - 1);
+        tl_prompt[sizeof(tl_prompt) - 1] = 0;
+        // Strip commas from the tool name so the CSV row stays valid.
+        for (char *c = tl_prompt; *c; c++) if (*c == ',') *c = ' ';
+    }
     xSemaphoreGive(g_state_mux);
+
+    if (was_disconnected) {
+        translog_append("conn", "");
+    }
+    // Throttle the routine "hb" row to one per 10 s. Events (prompt,
+    // approve, deny, conn, disconn, stale) write immediately - heartbeats
+    // are only valuable as a sparse "things were OK at this timestamp"
+    // sample, and the file fopen/fwrite churn isn't free.
+    static uint32_t s_last_hb_log_ms = 0;
+    uint32_t now_ms = millis();
+    if ((uint32_t)(now_ms - s_last_hb_log_ms) >= 10000) {
+        s_last_hb_log_ms = now_ms;
+        char extras[128];
+        snprintf(extras, sizeof(extras), "%u,%u,%u,%lu,%s",
+                 tl_total, tl_run, tl_wait, (unsigned long)tl_tok,
+                 tl_prompt[0] ? tl_prompt : "");
+        translog_append("hb", extras);
+    }
+    return;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -211,9 +259,9 @@ static void ack_ok(const char *cmd) {
 // up-front instead of being silently ignored.
 static void ack_unsupported(const char *cmd)
 {
-    char buf[96];
+    char buf[112];
     snprintf(buf, sizeof(buf),
-             "{\"ack\":\"%s\",\"ok\":false,"
+             "{\"ack\":\"%s\",\"ok\":false,\"n\":0,"
              "\"error\":\"character packs not supported on this hardware\"}",
              cmd);
     send_line(buf);
@@ -392,12 +440,10 @@ static void bridge_task(void *arg)
                 if (g_line_len > 0) {
                     g_line[g_line_len] = 0;
                     if (g_line[0] == '{') {
-                        // Temporary: log every received line at INFO so
-                        // failures like "Stick did not respond to
-                        // char_begin" are diagnosable without a logic
-                        // analyzer. Drop back to LOGD once xfer is
-                        // confirmed working end to end.
-                        ESP_LOGI(TAG, "rx: %.120s%s", g_line,
+                        // RX trace at DEBUG (kept for OTA diagnostics).
+                        // Was INFO during v0.1.0/v0.2.0 char-xfer
+                        // testing; lowered once xfer was confirmed.
+                        ESP_LOGD(TAG, "rx: %.120s%s", g_line,
                                  strlen(g_line) > 120 ? "..." : "");
                         apply_json(g_line);
                     }
@@ -406,21 +452,26 @@ static void bridge_task(void *arg)
             } else if (g_line_len < LINE_CAP - 1) {
                 g_line[g_line_len++] = (char)b;
             } else {
-                // Overflow - drop the partial line. Should be rare; the
-                // 1.5KB buffer covers heartbeats with full entries[].
+                // Overflow - drop the partial line. LINE_CAP is 4608
+                // (above the spec's 4 KB cap on turn events), so this
+                // path is unreachable for any spec-compliant peer; if
+                // it ever fires, the desktop is sending oversized JSON.
                 ESP_LOGW(TAG, "rx line overflow, dropped");
                 g_line_len = 0;
             }
         }
 
         // Mark connection stale after 30s with no heartbeat (per spec).
+        bool just_went_stale = false;
         xSemaphoreTake(g_state_mux, portMAX_DELAY);
         if (g_state.connected &&
             (millis() - g_state.last_updated_ms) > DATA_TIMEOUT_MS) {
             g_state.connected = false;
+            just_went_stale = true;
             ESP_LOGW(TAG, "heartbeat stale (>30s) - marked disconnected");
         }
         xSemaphoreGive(g_state_mux);
+        if (just_went_stale) translog_append("stale", "");
 
         vTaskDelay(pdMS_TO_TICKS(50));   // 20Hz drain - plenty for NUS bandwidth
     }
@@ -444,6 +495,16 @@ void bridge_init(void)
     // the canary bytes (0xa5a5a5a5) showed up in main_task's backtrace,
     // which only happens when another task overflows into the TCB region.
     xTaskCreate(bridge_task, "bridge", 8192, NULL, 5, NULL);
+
+    // Translog (SPIFFS): non-fatal if mount fails - logging just no-ops.
+    // Mounting here keeps the bridge as the sole owner of the translog
+    // lifecycle, since it's also the only producer.
+    if (translog_init() == ESP_OK) {
+        translog_append("boot", "");
+    } else {
+        ESP_LOGW(TAG, "translog disabled - SPIFFS mount failed");
+    }
+
     ESP_LOGI(TAG, "bridge up (petname='%s', owner='%s')", g_petname, g_ownername);
 }
 
@@ -513,4 +574,8 @@ void bridge_send_permission(bool allow)
     else       stats_on_denial();
     ESP_LOGI(TAG, "permission %s for %s (took %lus)",
              allow ? "approved" : "denied", id, (unsigned long)took_s);
+
+    char ex[24];
+    snprintf(ex, sizeof(ex), ",,,,%lus", (unsigned long)took_s);
+    translog_append(allow ? "approve" : "deny", ex);
 }
