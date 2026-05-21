@@ -164,7 +164,7 @@ Factory reset uses a two-step confirm with a five-second countdown.
 ```
 main/
   main.c              boot, render loop, screen selection, touch routing
-  display.c/.h        ST7789V raw SPI plus GPIO25 backlight
+  display.c/.h        ST7789V raw SPI plus GPIO25 backlight (LEDC PWM)
   framebuffer.c/.h    240x120 banded RGB565 buffer (~58KB), 2 pass flush
   gfx.c/.h            8x8 font and primitives that compose into the FB
   touch_button.c/.h   tap, double tap, long press detection

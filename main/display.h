@@ -43,3 +43,11 @@ void display_fill_color(uint16_t color);
  * Must call display_set_window() first.
  */
 void display_send_pixels(const uint8_t *data, int len);
+
+/**
+ * Set the backlight brightness (0..100, percent). 0 = off, 100 = full.
+ * Internally drives IO25 via LEDC (PWM). The pin is inverted on this
+ * board (LOW = bright), so the driver maps the percent linearly onto
+ * the inverted duty cycle.
+ */
+void display_set_backlight(uint8_t percent);

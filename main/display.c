@@ -4,6 +4,7 @@
 #include "display.h"
 #include <string.h>
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -17,6 +18,17 @@ static const char *TAG = "display";
 #define PIN_DISPLAY_DC      2
 #define PIN_DISPLAY_RST     4
 #define PIN_BACKLIGHT      25   // inverted: LOW = on, HIGH = off
+
+// Backlight PWM (LEDC). 5 kHz is above any audible buzz from cheap
+// boost circuits and well below the limit where MOSFET gate drive
+// starts to slew. 8 bits of resolution gives smooth fades and keeps
+// the math trivial (255 = full off, 0 = full on after inversion).
+#define BL_LEDC_TIMER     LEDC_TIMER_0
+#define BL_LEDC_MODE      LEDC_LOW_SPEED_MODE
+#define BL_LEDC_CHANNEL   LEDC_CHANNEL_0
+#define BL_LEDC_FREQ_HZ   5000
+#define BL_LEDC_RES_BITS  LEDC_TIMER_8_BIT
+#define BL_LEDC_DUTY_MAX  255
 
 static spi_device_handle_t spi_dev;
 
@@ -48,19 +60,37 @@ static void send_data_byte(uint8_t data)
 
 void display_init(void)
 {
-    // Configure DC, RST, and BACKLIGHT pins. BACKLIGHT is inverted
-    // (LOW = on); we set it LOW immediately so the panel is lit from
-    // first frame. The ESP32 default GPIO state happened to be LOW so
-    // the panel was visible without this - but relying on that is
-    // fragile and blocks future sleep / brightness work.
+    // DC + RST are plain GPIO outputs. BACKLIGHT (IO25) is driven by
+    // LEDC so the host can fade for idle dimming / burn-in protection.
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << PIN_DISPLAY_DC)
-                      | (1ULL << PIN_DISPLAY_RST)
-                      | (1ULL << PIN_BACKLIGHT),
+                      | (1ULL << PIN_DISPLAY_RST),
         .mode         = GPIO_MODE_OUTPUT,
     };
     gpio_config(&io_conf);
-    gpio_set_level(PIN_BACKLIGHT, 0);   // turn the backlight ON
+
+    // LEDC: 5 kHz / 8 bit on IO25. Start at 100% (duty=0 because the
+    // pin is inverted - LOW = backlight on) so the panel lights from
+    // first frame, same UX as the prior pure-GPIO path.
+    ledc_timer_config_t bl_timer = {
+        .speed_mode      = BL_LEDC_MODE,
+        .timer_num       = BL_LEDC_TIMER,
+        .duty_resolution = BL_LEDC_RES_BITS,
+        .freq_hz         = BL_LEDC_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&bl_timer));
+
+    ledc_channel_config_t bl_chan = {
+        .gpio_num   = PIN_BACKLIGHT,
+        .speed_mode = BL_LEDC_MODE,
+        .channel    = BL_LEDC_CHANNEL,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .timer_sel  = BL_LEDC_TIMER,
+        .duty       = 0,    // duty 0 = pin LOW = backlight ON (inverted)
+        .hpoint     = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&bl_chan));
 
     // Initialize SPI bus. The framebuffer flushes a whole band
     // (240*120*2 = 57,600 B) in one DMA transfer, so max_transfer_sz
@@ -164,4 +194,16 @@ void display_send_pixels(const uint8_t *data, int len)
         .tx_buffer = data,
     };
     spi_device_polling_transmit(spi_dev, &t);
+}
+
+void display_set_backlight(uint8_t percent)
+{
+    if (percent > 100) percent = 100;
+    // Inverted: 100% brightness == duty 0 (pin LOW). Linear map across
+    // the 8-bit range; one whole-frame redraw of duty=0 vs full off is
+    // visually indistinguishable from the prior GPIO-on path.
+    uint32_t duty = BL_LEDC_DUTY_MAX -
+                    (uint32_t)((BL_LEDC_DUTY_MAX * (uint32_t)percent) / 100u);
+    ledc_set_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL, duty);
+    ledc_update_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL);
 }

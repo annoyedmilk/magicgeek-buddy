@@ -51,6 +51,15 @@ static const char *TAG = "buddy";
 static uint8_t  g_transcript_scroll = 0;
 static uint16_t g_last_line_gen     = 0;
 
+// Backlight idle-fade. Updated from any touch event or whenever an
+// interesting state change happens in buddy_task; consumed by the
+// dim/fade logic at the bottom of the same task. Volatile because the
+// touch ISR-adjacent task writes while buddy_task reads.
+static volatile uint32_t g_last_activity_ms = 0;
+#define BL_IDLE_FADE_AFTER_MS  (5 * 60 * 1000)   // 5 minutes of P_SLEEP
+#define BL_IDLE_FADE_DURATION_MS 2000            // 2-second envelope
+#define BL_DIM_PERCENT          0                // fade-to-off target
+
 // ─────────────────────────────────────────────────────────────────────
 // Touch routing. Priority (highest first):
 //   1. UI overlay (menu / info / confirm) - owns gestures when open
@@ -63,6 +72,12 @@ static uint16_t g_last_line_gen     = 0;
 // ─────────────────────────────────────────────────────────────────────
 static void on_touch(touch_event_t ev)
 {
+    // Any touch resets the idle timer and snaps the backlight back on.
+    // Even gestures the UI consumes count as activity - the user is
+    // clearly looking at the screen.
+    g_last_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    display_set_backlight(100);
+
     switch (ev) {
     case TOUCH_EVENT_TAP:
         if (ui_on_tap()) return;
@@ -183,6 +198,7 @@ static persona_view_t persona_view(persona_state_t p, const tama_state_t *s)
     case P_BUSY:      return (persona_view_t){ "BUSY",      COLOR_YELLOW,       "sessions running" };
     case P_ATTENTION: return (persona_view_t){ "ATTENTION", COLOR_CLAUDE_CORAL, "approval pending" };
     case P_CELEBRATE: return (persona_view_t){ "CELEBRATE", COLOR_GREEN,        "task complete!" };
+    case P_DIZZY:     return (persona_view_t){ "TURN",      COLOR_CYAN,         "thought delivered" };
     }
     return (persona_view_t){ "?", COLOR_CLAUDE_DIM, "" };
 }
@@ -223,24 +239,78 @@ static void compose_persona(void *ctx)
     // ASCII pet (GIF pack support was removed - see CLAUDE.md).
     buddy_render(p);
 
-    // ─── Transcript (3 lines, newest at bottom, scrollable via TAP) ─
+    // ─── Transcript (up to 3 rows, newest at bottom, scrollable via TAP) ─
     // The bridge keeps the most-recent `n_lines` of entries[] in
     // s->lines[], newest at index 0 per REFERENCE.md. We render bottom-
     // up so the eye lands on the freshest line; scrolling steps further
-    // back into history. The newest visible line gets full PAPER; the
-    // two above it dim, mimicking the source's "fresh row" highlight.
+    // back into history. Entries longer than the 30-column width word-
+    // wrap onto a second row (consuming one of the 3 vertical slots).
+    // The newest visible line gets full PAPER; older lines dim.
     {
-        const int row_y[3] = { 130, 140, 150 };
-        for (int row = 0; row < 3; row++) {
-            // row 0 = oldest visible, row 2 = newest
-            int idx = (int)g_transcript_scroll + (2 - row);
-            if (idx < 0 || idx >= (int)s->n_lines) continue;
-            uint16_t col = (row == 2) ? COLOR_CLAUDE_PAPER : COLOR_CLAUDE_DIM;
-            // Truncate at 30 chars (~ panel width at scale 1, 8 px glyph).
-            char buf[31];
-            snprintf(buf, sizeof(buf), "%.30s", s->lines[idx]);
-            gfx_text_center(row_y[row], buf, col, COLOR_BLACK, 1);
+        const int row_y[3] = { 130, 140, 150 };  // bottom-up: [2]=newest
+        const int max_cols = 30;                  // 240px / 8px glyph
+        int rows_left = 3;                        // available row slots
+        int row = 2;                              // bottom row first
+        int idx = (int)g_transcript_scroll;       // newest visible
+
+        while (rows_left > 0 && idx < (int)s->n_lines) {
+            const char *src = s->lines[idx];
+            int n = (int)strlen(src);
+
+            // Find an optional break point if this entry overflows one row.
+            // Prefer the last space before column 30; fall back to a hard
+            // break if the entry has no spaces (rare; e.g. a long token).
+            int line_len = (n > max_cols) ? max_cols : n;
+            int wrap_at  = 0;     // bytes consumed from src on this entry
+            int part2_len = 0;
+            char part1[max_cols + 1];
+            char part2[max_cols + 1];
+            part2[0] = 0;
+
+            if (n <= max_cols) {
+                memcpy(part1, src, (size_t)n);
+                part1[n] = 0;
+                wrap_at = n;
+            } else {
+                // Look back from col 30 for a space to wrap on.
+                int br = max_cols;
+                while (br > 8 && src[br] != ' ') br--;
+                if (src[br] != ' ') br = max_cols;  // no space found
+                memcpy(part1, src, (size_t)br);
+                part1[br] = 0;
+                wrap_at = br;
+                // Skip the space we wrapped on; clip second row to 30.
+                int s2 = (src[br] == ' ') ? br + 1 : br;
+                part2_len = n - s2;
+                if (part2_len > max_cols) part2_len = max_cols;
+                memcpy(part2, src + s2, (size_t)part2_len);
+                part2[part2_len] = 0;
+            }
+            (void)line_len;
+            (void)wrap_at;
+
+            // Color: only the newest entry (its bottom row) is PAPER.
+            // Everything else is DIM regardless of wrap state.
+            bool newest = (idx == (int)g_transcript_scroll);
+            uint16_t col_new = COLOR_CLAUDE_PAPER;
+            uint16_t col_old = COLOR_CLAUDE_DIM;
+
+            if (part2_len > 0 && rows_left >= 2) {
+                // 2-row entry: continuation drawn below, head above.
+                gfx_text_center(row_y[row],     part2, newest ? col_new : col_old, COLOR_BLACK, 1);
+                gfx_text_center(row_y[row - 1], part1, col_old,                    COLOR_BLACK, 1);
+                row       -= 2;
+                rows_left -= 2;
+            } else {
+                // Single row: either the entry fit, OR we only had 1 slot
+                // left and we drop the continuation (newest still wins).
+                gfx_text_center(row_y[row], part1, newest ? col_new : col_old, COLOR_BLACK, 1);
+                row--;
+                rows_left--;
+            }
+            idx++;
         }
+
         // Scroll indicator "-N" in the corner when not at newest.
         if (g_transcript_scroll > 0) {
             char ind[6];
@@ -399,6 +469,9 @@ static void buddy_task(void *arg)
     // that threshold AND WiFi is up (proof the network stack works).
     uint32_t boot_t0_ms = (uint32_t)(esp_timer_get_time() / 1000);
     bool     marked_valid = false;
+    // Seed the idle-fade clock so we don't dim during the first 5 min of
+    // uptime (the user just plugged it in and is watching it).
+    g_last_activity_ms = boot_t0_ms;
 
     screen_t last = (screen_t)-1;
     uint32_t last_pk = 0;
@@ -409,6 +482,10 @@ static void buddy_task(void *arg)
     // One-shot CELEBRATE override on level-up. Holds for ~3s like the
     // source's triggerOneShot(P_CELEBRATE, 3000).
     uint32_t celebrate_until_ms = 0;
+    // One-shot DIZZY override when the desktop fires a turn event.
+    // 1.5s is long enough for the user to notice (a couple of animation
+    // ticks at 5fps) but short enough not to mask the underlying persona.
+    uint32_t dizzy_until_ms = 0;
 
     // Animation cadence: 5 fps on the persona screen, matching the
     // source's TICK_MS=200. Other screens redraw only on state change.
@@ -428,6 +505,16 @@ static void buddy_task(void *arg)
         bool celebrating = (int32_t)(celebrate_until_ms
             - (uint32_t)(esp_timer_get_time() / 1000)) > 0;
 
+        // Edge-trigger the dizzy one-shot on a turn event from the bridge.
+        // Lower priority than CELEBRATE: if both are active we keep the
+        // level-up animation since it's the rarer, more meaningful signal.
+        if (bridge_poll_turn()) {
+            dizzy_until_ms = (uint32_t)(esp_timer_get_time() / 1000) + 1500;
+            ESP_LOGI(TAG, "turn event → DIZZY for 1.5s");
+        }
+        bool dizzy = !celebrating && (int32_t)(dizzy_until_ms
+            - (uint32_t)(esp_timer_get_time() / 1000)) > 0;
+
         uint32_t pk = ble_passkey();
         screen_t scr;
         if (pk != 0)                        scr = SCR_PASSKEY;
@@ -442,8 +529,11 @@ static void buddy_task(void *arg)
         // Redraw triggers: screen changed, passkey digits changed, new
         // prompt id, persona changed, transcript content changed (for
         // future entries[] rendering - kept now so msg/counts refresh).
-        // CELEBRATE overrides the derived persona while active.
-        persona_state_t persona = celebrating ? P_CELEBRATE : bridge_derive(&s);
+        // Overrides on the derived persona (highest priority first):
+        //   CELEBRATE (level-up)  >  DIZZY (turn event)  >  derived
+        persona_state_t persona = celebrating ? P_CELEBRATE
+                                : dizzy       ? P_DIZZY
+                                              : bridge_derive(&s);
 
         // Animation tick on the persona screen: re-render every 200ms
         // so the pet actually moves. buddy_tick_advance() runs OUTSIDE
@@ -458,11 +548,12 @@ static void buddy_task(void *arg)
             || (scr == SCR_PASSKEY && pk != last_pk)
             || (scr == SCR_PROMPT  && strcmp(s.prompt_id, last_prompt_id) != 0)
             || (scr == SCR_PERSONA && (persona != last_persona || s.line_gen != last_line_gen))
-            // When the celebrate timer expires while on the persona
+            // When the celebrate/dizzy timers expire while on the persona
             // screen, the derived persona may equal the previous (e.g.
             // IDLE → IDLE) so the normal trigger misses. Force a redraw
-            // when celebrating *transitions* (poll edge - see last_persona).
+            // when either override *transitions* (poll edge).
             || (scr == SCR_PERSONA && (last_persona == P_CELEBRATE) != celebrating)
+            || (scr == SCR_PERSONA && (last_persona == P_DIZZY)     != dizzy)
             || anim_due
             // The overlay state changed (menu opened, item moved, etc.).
             // ui_poll_dirty() consumes the flag so it edge-triggers once.
@@ -530,6 +621,43 @@ static void buddy_task(void *arg)
             && wifi_manager_get_httpd() != NULL) {
             ota_mark_valid();
             marked_valid = true;
+        }
+
+        // ─── Idle backlight fade (burn-in protection) ─────────────────
+        // The ST7789V IPS panel is prone to image retention on long
+        // static fields. When the device sits in P_SLEEP (no desktop
+        // peer, no UI activity) for > BL_IDLE_FADE_AFTER_MS, fade the
+        // backlight to 0 over BL_IDLE_FADE_DURATION_MS. Any touch or
+        // persona transition out of SLEEP snaps us back to 100% via
+        // on_touch() or the activity update below.
+        {
+            // Treat "interesting" persona states and active overlays as
+            // activity so the dim timer only counts true idle time.
+            bool active_ui   = (ui_get_state() != UI_NORMAL);
+            bool peer_alive  = (scr != SCR_PERSONA) || (persona != P_SLEEP);
+            if (active_ui || peer_alive) {
+                g_last_activity_ms = now_ms;
+            }
+            uint32_t idle_for = now_ms - g_last_activity_ms;
+            uint8_t  target;
+            if (idle_for < BL_IDLE_FADE_AFTER_MS) {
+                target = 100;
+            } else {
+                uint32_t into_fade = idle_for - BL_IDLE_FADE_AFTER_MS;
+                if (into_fade >= BL_IDLE_FADE_DURATION_MS) {
+                    target = BL_DIM_PERCENT;
+                } else {
+                    // Linear ramp from 100 → BL_DIM_PERCENT.
+                    uint32_t span = 100u - BL_DIM_PERCENT;
+                    uint32_t drop = (span * into_fade) / BL_IDLE_FADE_DURATION_MS;
+                    target = (uint8_t)(100u - drop);
+                }
+            }
+            static uint8_t s_last_target = 100;
+            if (target != s_last_target) {
+                display_set_backlight(target);
+                s_last_target = target;
+            }
         }
 
         // 100 ms tick - gives the persona screen ~5 fps animation room

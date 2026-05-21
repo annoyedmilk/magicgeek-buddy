@@ -16,8 +16,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "cJSON.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -53,11 +56,20 @@ static inline uint32_t millis(void) {
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
-// One-line accumulator for the JSON stream. Sized to comfortably hold a
-// full heartbeat (entries[] + a transcript snippet + headroom).
-#define LINE_CAP 1536
+// One-line accumulator for the JSON stream. Heartbeats fit in ~1.5KB,
+// but turn events (`{"evt":"turn",...}`) can carry up to 4KB of content
+// per the Hardware Buddy spec. Sized to 4608B so we can ingest the full
+// event line and decide whether to act on or discard the body, instead
+// of silently truncating mid-payload. Costs ~3KB of static BSS.
+#define LINE_CAP 4608
 static char g_line[LINE_CAP];
 static size_t g_line_len = 0;
+
+// One-shot edge for `{"evt":"turn"}`. Set by apply_json on a fresh turn
+// event, consumed by bridge_poll_turn (the render loop polls it once per
+// tick). Plain bool: read/write is atomic on xtensa for a single byte,
+// and the worst-case race is a missed or doubled trigger - benign.
+static volatile bool g_turn_pending = false;
 
 // ─────────────────────────────────────────────────────────────────────
 // 2. JSON helpers
@@ -211,18 +223,22 @@ static void ack_status(void)
 {
     // Manual printf into a fixed buffer - heap-light and shape-stable
     // for the desktop's parser. See REFERENCE.md "Status response".
+    // `max_blk` is the largest contiguous free block (MALLOC_CAP_8BIT);
+    // alongside `heap` it lets the desktop spot heap fragmentation over
+    // long uptimes without us having to expose a separate command.
     const stats_t *s = stats_get();
-    char buf[384];
+    char buf[416];
     int len = snprintf(buf, sizeof(buf),
         "{\"ack\":\"status\",\"ok\":true,\"n\":0,\"data\":{"
         "\"name\":\"%s\",\"owner\":\"%s\",\"sec\":%s,"
-        "\"sys\":{\"up\":%lu,\"heap\":%u},"
+        "\"sys\":{\"up\":%lu,\"heap\":%u,\"max_blk\":%u},"
         "\"stats\":{\"appr\":%u,\"deny\":%u,\"vel\":%u,\"nap\":%lu,\"lvl\":%u}"
         "}}",
         g_petname, g_ownername,
         ble_secure() ? "true" : "false",
         (unsigned long)(millis() / 1000),
         (unsigned)esp_get_free_heap_size(),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
         s->approvals, s->denials,
         stats_median_velocity(),
         (unsigned long)s->nap_seconds,
@@ -288,17 +304,74 @@ static bool dispatch(const cJSON *doc)
 // 5. Top-level JSON router
 // ─────────────────────────────────────────────────────────────────────
 
+// One-shot time sync the desktop sends right after connect:
+// {"time":[epoch_seconds, tz_offset_seconds]}. We have no hardware RTC,
+// so we plug the value straight into the ESP32's software clock via
+// settimeofday(); subsequent localtime()/gmtime() calls now reflect the
+// host's wall clock. Survives until reboot. The TZ offset goes into the
+// POSIX TZ env so localtime() rolls midnight correctly on the device.
+static void apply_time_sync(const cJSON *arr)
+{
+    if (!cJSON_IsArray(arr)) return;
+    cJSON *epoch_v  = cJSON_GetArrayItem(arr, 0);
+    cJSON *offset_v = cJSON_GetArrayItem(arr, 1);
+    if (!cJSON_IsNumber(epoch_v)) return;
+
+    struct timeval tv = {
+        .tv_sec  = (time_t)epoch_v->valuedouble,
+        .tv_usec = 0,
+    };
+    settimeofday(&tv, NULL);
+
+    if (cJSON_IsNumber(offset_v)) {
+        // POSIX TZ: sign is reversed (`UTC-7` for an offset of +7h).
+        // The spec offset is in seconds east of UTC.
+        int off_s = offset_v->valueint;
+        int sign  = (off_s <= 0) ? +1 : -1;   // POSIX-flipped
+        int abs_s = (off_s < 0) ? -off_s : off_s;
+        int h = abs_s / 3600;
+        int m = (abs_s % 3600) / 60;
+        char tz[16];
+        snprintf(tz, sizeof(tz), "UTC%c%d:%02d", sign > 0 ? '+' : '-', h, m);
+        setenv("TZ", tz, 1);
+        tzset();
+    }
+    ESP_LOGI(TAG, "time sync: epoch=%lld tz=%s",
+             (long long)tv.tv_sec, getenv("TZ") ? getenv("TZ") : "(unset)");
+}
+
 static void apply_json(const char *line)
 {
     cJSON *doc = cJSON_Parse(line);
     if (!doc) return;
 
-    // Commands first (they carry "cmd"); otherwise treat as heartbeat.
-    // Turn events ({"evt":"turn",...}) are not rendered on this hardware;
-    // ignore them quietly.
-    if (!dispatch(doc) && cJSON_IsObject(doc)) {
+    // 1. Time-sync (top-level "time" array) - no `cmd`, no `evt`.
+    cJSON *time_arr = cJSON_GetObjectItemCaseSensitive(doc, "time");
+    if (cJSON_IsArray(time_arr)) {
+        apply_time_sync(time_arr);
+        cJSON_Delete(doc);
+        return;
+    }
+
+    // 2. Commands ({"cmd":...}). dispatch() owns the ack.
+    if (dispatch(doc)) {
+        cJSON_Delete(doc);
+        return;
+    }
+
+    // 3. Events ({"evt":"turn",...}). The 4KB payload is intentionally
+    //    not retained - only the edge is forwarded to the render loop,
+    //    which fires a one-shot P_DIZZY animation. cJSON_Delete frees
+    //    the parsed content array immediately after this block.
+    if (cJSON_IsObject(doc)) {
         const char *evt = json_str(doc, "evt");
-        if (!evt) apply_heartbeat(doc);
+        if (evt && strcmp(evt, "turn") == 0) {
+            g_turn_pending = true;
+            ESP_LOGD(TAG, "turn event (line=%uB)", (unsigned)strlen(line));
+        } else if (!evt) {
+            // 4. Heartbeat - the implicit catch-all.
+            apply_heartbeat(doc);
+        }
     }
     cJSON_Delete(doc);
 }
@@ -389,6 +462,13 @@ persona_state_t bridge_derive(const tama_state_t *s)
     if (s->recently_completed)     return P_CELEBRATE;
     if (s->sessions_running >= 3)  return P_BUSY;
     return P_IDLE;
+}
+
+bool bridge_poll_turn(void)
+{
+    bool t = g_turn_pending;
+    if (t) g_turn_pending = false;
+    return t;
 }
 
 bool bridge_data_alive(void)

@@ -39,12 +39,17 @@ typedef struct {
 
 // Persona derived from the snapshot. Each value drives a specific
 // ASCII pet animation in buddy.c and a screen accent color in main.c.
+// P_DIZZY is a one-shot reaction state fired by the bridge whenever a
+// `{"evt":"turn"}` event arrives; main.c overrides the derived persona
+// with P_DIZZY for ~1.5s so the user gets a visible "turn completed"
+// micro-interaction without persistent state.
 typedef enum {
     P_SLEEP,        // no desktop connected
     P_IDLE,         // connected, nothing urgent
     P_BUSY,         // ≥3 sessions actively generating
     P_ATTENTION,    // a permission prompt is waiting
     P_CELEBRATE,    // recently completed
+    P_DIZZY,        // turn just landed (one-shot, ~1.5s)
 } persona_state_t;
 
 // Initialize the bridge. Must be called after ble_init() since acks are
@@ -67,3 +72,8 @@ void bridge_send_permission(bool allow);
 // Has the device received any heartbeat in the last DATA_TIMEOUT_MS?
 // Cheaper helper for the render loop than reading the full snapshot.
 bool bridge_data_alive(void);
+
+// One-shot edge: returns true exactly once after a `{"evt":"turn"}`
+// landed. Lets the render loop trigger a brief P_DIZZY animation
+// without keeping a "turn pending" field in tama_state_t.
+bool bridge_poll_turn(void);

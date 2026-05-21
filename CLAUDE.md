@@ -84,7 +84,7 @@ to the transcript scroller on the persona screen.
 ```
 main/
   main.c              boot, render loop, screen selection, touch routing
-  display.c/.h        ST7789V raw SPI, GPIO25 backlight init
+  display.c/.h        ST7789V raw SPI, GPIO25 backlight via LEDC PWM
   framebuffer.c/.h    240x120 banded RGB565 (about 58 KB), 2 pass flush
   gfx.c/.h            8x8 font, fills, text composing into the FB
   touch_button.c/.h   tap, double tap, long press gestures
@@ -271,8 +271,6 @@ line buffer is 1.5 KB. Tasks: `buddy` 8 KB, `bridge` 8 KB.
 Source project features that do not apply to this hardware and are
 not implemented:
 
-* Brightness slider (no PWM on backlight yet; `display.c` only sets
-  the pin high or low).
 * Shake to trigger dizzy state, face down to nap (no IMU).
 * Battery percentage, charging indicator (no AXP).
 * Hardware RTC clock face (no DS3231 or equivalent).
