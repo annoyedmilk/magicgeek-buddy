@@ -30,7 +30,14 @@
 
 static const char *TAG = "bridge";
 
-#define DATA_TIMEOUT_MS 30000   // REFERENCE.md: stale if no heartbeat in 30s
+// 45s: REFERENCE.md says "stale if no heartbeat in 30s", but empirical
+// captures (see commit history) show the macOS desktop legitimately
+// pauses heartbeats for ~32s on its own (display sleep transitions,
+// app backgrounding). A 30s threshold tore down healthy links; 45s
+// covers the observed worst-case pause with margin while still firing
+// quickly enough to recover the v0.3.1 CoreBluetooth desync scenario
+// (which manifests as minutes of silence, not seconds).
+#define DATA_TIMEOUT_MS 45000
 
 // ─────────────────────────────────────────────────────────────────────
 // 1. State + line buffer
@@ -422,9 +429,11 @@ static void bridge_task(void *arg)
                 if (!g_line_dropping && g_line_len > 0) {
                     g_line[g_line_len] = 0;
                     if (g_line[0] == '{') {
-                        // RX trace at DEBUG (kept for OTA diagnostics).
-                        // Was INFO during v0.1.0/v0.2.0 char-xfer
-                        // testing; lowered once xfer was confirmed.
+                        // RX trace at DEBUG (compiled out at INFO level,
+                        // so never reaches /debug/log). Re-enabled to
+                        // INFO during diagnosis only; the stale-loop bug
+                        // was the macOS desktop pausing heartbeats for
+                        // ~32s, fixed by raising DATA_TIMEOUT_MS above.
                         ESP_LOGD(TAG, "rx: %.120s%s", g_line,
                                  g_line_len > 120 ? "..." : "");
                         apply_json(g_line, g_line_len);
