@@ -122,9 +122,12 @@ esp_err_t wifi_manager_connect(int timeout_ms)
 
     ESP_LOGI(TAG, "Connecting to '%s'...", ssid);
 
+    // wifi_config_t SSID/password are length-bounded, not NUL-terminated.
+    // strncpy(dst, src, sizeof(dst)-1) trips -Werror=stringop-truncation on
+    // GCC 15 because src can be the full buffer width.
     wifi_config_t wifi_cfg = {0};
-    strncpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid) - 1);
-    strncpy((char *)wifi_cfg.sta.password, pass, sizeof(wifi_cfg.sta.password) - 1);
+    memcpy(wifi_cfg.sta.ssid, ssid, strnlen(ssid, sizeof(wifi_cfg.sta.ssid)));
+    memcpy(wifi_cfg.sta.password, pass, strnlen(pass, sizeof(wifi_cfg.sta.password)));
 
     retry_count = 0;
     xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
@@ -162,8 +165,8 @@ static void wifi_connect_task(void *arg)
     ESP_LOGI(TAG, "Connecting to '%s' (background)...", ssid);
 
     wifi_config_t wifi_cfg = {0};
-    strncpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid) - 1);
-    strncpy((char *)wifi_cfg.sta.password, pass, sizeof(wifi_cfg.sta.password) - 1);
+    memcpy(wifi_cfg.sta.ssid, ssid, strnlen(ssid, sizeof(wifi_cfg.sta.ssid)));
+    memcpy(wifi_cfg.sta.password, pass, strnlen(pass, sizeof(wifi_cfg.sta.password)));
 
     retry_count = 0;
     xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
