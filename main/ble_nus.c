@@ -472,11 +472,19 @@ size_t ble_write(const uint8_t *data, size_t len)
     if (!ble_connected() || !tx_subscribed || !link_secure ||
         tx_val_handle == 0) return 0;
 
-    // Per-notify max is (MTU - 3). macOS negotiates ~185; cap at 180 to
-    // stay clear of stack edge cases. A short delay between chunks lets
-    // the host drain its tx queue so big snapshots don't drop frames.
+    // Per-notify max is (MTU - 3). Cap at 244 (Espressif reference's
+    // NOTIFY_CHUNK_CAP) so we ride the upper limit of negotiated MTUs;
+    // macOS Sequoia + DLE can push to 251. Pre-MTU-exchange the link
+    // is still at the 23-byte ATT default, hence the 20-byte floor.
     size_t chunk = (link_mtu > 3) ? (size_t)(link_mtu - 3) : 20;
-    if (chunk > 180) chunk = 180;
+    if (chunk > 244) chunk = 244;
+
+    // The 4 ms inter-chunk delay was an early defensive sleep to let the
+    // host drain. With a negotiated MTU > 100 the link is healthy and the
+    // notify completion already provides flow control; the sleep just
+    // adds ~12 ms latency to a 600-byte status ack. Skip it past the
+    // ATT-default stage.
+    const TickType_t chunk_delay = (link_mtu > 100) ? 0 : pdMS_TO_TICKS(2);
 
     size_t sent = 0;
     while (sent < len) {
@@ -491,7 +499,7 @@ size_t ble_write(const uint8_t *data, size_t len)
             break;
         }
         sent += n;
-        vTaskDelay(pdMS_TO_TICKS(4));
+        if (chunk_delay) vTaskDelay(chunk_delay);
     }
     return sent;
 }

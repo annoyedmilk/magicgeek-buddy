@@ -413,9 +413,11 @@ static void apply_time_sync(const cJSON *arr)
              (long long)tv.tv_sec, getenv("TZ") ? getenv("TZ") : "(unset)");
 }
 
-static void apply_json(const char *line)
+static void apply_json(const char *line, size_t line_len)
 {
-    cJSON *doc = cJSON_Parse(line);
+    // cJSON_ParseWithLength avoids a second strlen pass over a 4 KB turn
+    // event and tolerates embedded NULs in malformed input.
+    cJSON *doc = cJSON_ParseWithLength(line, line_len);
     if (!doc) return;
 
     // 1. Time-sync (top-level "time" array) - no `cmd`, no `evt`.
@@ -469,8 +471,8 @@ static void bridge_task(void *arg)
                         // Was INFO during v0.1.0/v0.2.0 char-xfer
                         // testing; lowered once xfer was confirmed.
                         ESP_LOGD(TAG, "rx: %.120s%s", g_line,
-                                 strlen(g_line) > 120 ? "..." : "");
-                        apply_json(g_line);
+                                 g_line_len > 120 ? "..." : "");
+                        apply_json(g_line, g_line_len);
                     }
                 }
                 g_line_len = 0;
