@@ -116,11 +116,13 @@ void display_init(void)
                                                // failed due to signal degradation
         .mode           = 3,
         .spics_io_num   = -1,
-        // queue_size=3 allows the SPI driver to hold up to 3 transactions
-        // internally. With 10 bands we only ever have 1 in-flight at a time,
-        // but a depth > 1 prevents spi_device_queue_trans from blocking on
-        // the first call if the driver is briefly busy.
-        .queue_size     = 3,
+        // queue_size=1: fb_frame always wait_async + drain before issuing
+        // the next polling_transmit (display_set_window), so only one
+        // transaction is ever in flight. queue_size>1 lets the driver hold
+        // additional descriptor slots that the polling-transmit path then
+        // races against - observed as a hard render-task deadlock inside
+        // spi_device_polling_transmit after a few minutes of normal frames.
+        .queue_size     = 1,
     };
     ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev, &spi_dev));
 
