@@ -2,6 +2,7 @@
 // Ported verbatim from the proven F1 Dashboard firmware - the init
 // sequence and inversion (0x21) are tuned to this exact display.
 #include "display.h"
+#include "framebuffer.h"        // FB_BAND_H for max_transfer_sz
 #include <string.h>
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -30,7 +31,13 @@ static const char *TAG = "display";
 #define BL_LEDC_RES_BITS  LEDC_TIMER_8_BIT
 #define BL_LEDC_DUTY_MAX  255
 
-static spi_device_handle_t spi_dev;
+static spi_device_handle_t  spi_dev;
+
+// One persistent transaction descriptor for the async pixel path.
+// Only one band transfer is ever in-flight at a time (fb_frame drains
+// before queuing the next), so a single descriptor is sufficient.
+static spi_transaction_t    s_async_trans;
+static bool                 s_async_pending = false;
 
 static void send_cmd(uint8_t cmd)
 {
@@ -92,24 +99,28 @@ void display_init(void)
     };
     ESP_ERROR_CHECK(ledc_channel_config(&bl_chan));
 
-    // Initialize SPI bus. The framebuffer flushes a whole band
-    // (240*120*2 = 57,600 B) in one DMA transfer, so max_transfer_sz
-    // is sized for a full band.
+    // Each async pixel transfer covers one band: FB_W × FB_BAND_H × 2 bytes
+    // (240 × 24 × 2 = 11 520 B). max_transfer_sz must be >= that.
     spi_bus_config_t bus = {
         .mosi_io_num   = PIN_DISPLAY_MOSI,
         .miso_io_num   = -1,
         .sclk_io_num   = PIN_DISPLAY_CLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = DISPLAY_WIDTH * 120 * 2,
+        .max_transfer_sz = DISPLAY_WIDTH * FB_BAND_H * 2,
     };
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
 
     spi_device_interface_config_t dev = {
-        .clock_speed_hz = 20 * 1000 * 1000,
+        .clock_speed_hz = 20 * 1000 * 1000,   // 20 MHz; 40 MHz was tested and
+                                               // failed due to signal degradation
         .mode           = 3,
         .spics_io_num   = -1,
-        .queue_size     = 1,
+        // queue_size=3 allows the SPI driver to hold up to 3 transactions
+        // internally. With 10 bands we only ever have 1 in-flight at a time,
+        // but a depth > 1 prevents spi_device_queue_trans from blocking on
+        // the first call if the driver is briefly busy.
+        .queue_size     = 3,
     };
     ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev, &spi_dev));
 
@@ -194,6 +205,29 @@ void display_send_pixels(const uint8_t *data, int len)
         .tx_buffer = data,
     };
     spi_device_polling_transmit(spi_dev, &t);
+}
+
+void display_queue_pixels_async(const uint8_t *data, int len)
+{
+    if (len == 0) return;
+    // s_async_trans must remain valid until display_wait_async() returns.
+    // Callers pass one of the two static DMA-capable band buffers, so the
+    // lifetime is guaranteed.
+    s_async_trans = (spi_transaction_t){
+        .length    = (size_t)len * 8,
+        .tx_buffer = data,
+    };
+    gpio_set_level(PIN_DISPLAY_DC, 1);
+    ESP_ERROR_CHECK(spi_device_queue_trans(spi_dev, &s_async_trans, portMAX_DELAY));
+    s_async_pending = true;
+}
+
+void display_wait_async(void)
+{
+    if (!s_async_pending) return;
+    spi_transaction_t *result;
+    ESP_ERROR_CHECK(spi_device_get_trans_result(spi_dev, &result, portMAX_DELAY));
+    s_async_pending = false;
 }
 
 void display_set_backlight(uint8_t percent)

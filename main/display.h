@@ -40,9 +40,28 @@ void display_fill_color(uint16_t color);
 
 /**
  * Send raw pixel data (RGB565, big-endian) to the display.
- * Must call display_set_window() first.
+ * Blocking polling transmit. Must call display_set_window() first.
+ * Not used by the normal render path (which goes through the async pair
+ * below), but kept for callers that need a synchronous one-shot send.
  */
 void display_send_pixels(const uint8_t *data, int len);
+
+/**
+ * Queue an async DMA pixel transfer. Returns immediately; the SPI
+ * peripheral ships the data in the background. The `data` pointer must
+ * remain valid until display_wait_async() returns.
+ * Must call display_set_window() first, and display_wait_async() must
+ * have been called to drain any previous in-flight transfer before
+ * calling display_set_window() again.
+ */
+void display_queue_pixels_async(const uint8_t *data, int len);
+
+/**
+ * Block until the most recently queued async transfer completes.
+ * No-op if no transfer is in flight. Must be called before issuing
+ * any spi_device_polling_transmit (commands, set_window, fill_color).
+ */
+void display_wait_async(void);
 
 /**
  * Set the backlight brightness (0..100, percent). 0 = off, 100 = full.

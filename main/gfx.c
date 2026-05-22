@@ -121,13 +121,19 @@ void gfx_char(int x, int y, char c, uint16_t fg, uint16_t bg, int scale)
     const uint8_t *g = font_8x8[c - 32];
     if (scale < 1) scale = 1;
 
+    if (scale == 1) {
+        for (int row = 0; row < 8; row++) {
+            uint8_t bits = g[row];
+            for (int col = 0; col < 8; col++) {
+                fb_set_px(x + col, y + row, (bits & (0x80 >> col)) ? fg : bg);
+            }
+        }
+        return;
+    }
     for (int row = 0; row < 8; row++) {
         uint8_t bits = g[row];
         for (int col = 0; col < 8; col++) {
             uint16_t px = (bits & (0x80 >> col)) ? fg : bg;
-            // Expand each font pixel to a scale x scale rect. fb_fill_rect
-            // is cheap (clipped + memset-like) so the scale=1 case is just
-            // ~64 tiny fills per glyph - fine since the SPI cost is gone.
             fb_fill_rect(x + col * scale, y + row * scale, scale, scale, px);
         }
     }

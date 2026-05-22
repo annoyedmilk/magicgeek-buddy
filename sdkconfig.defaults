@@ -44,3 +44,8 @@ CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256
 
 # Main task stack: framebuffer init + JSON parsing need headroom.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Optimize for throughput. The pixel-fill loops in framebuffer.c and the
+# scale=1 gfx_char path benefit from loop unrolling at -O2. OTA slot is
+# 1.875MB so the modest code-size increase is not a concern.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y

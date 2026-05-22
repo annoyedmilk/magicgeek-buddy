@@ -39,6 +39,7 @@ static const char *TAG = "bridge";
 
 static tama_state_t      g_state;
 static SemaphoreHandle_t g_state_mux;
+static volatile uint32_t g_state_generation = 0;
 
 // Timestamp the *arrival* of each new prompt id so stats_on_approval can
 // record seconds-to-respond into the velocity ring. Cleared (and re-armed)
@@ -220,6 +221,8 @@ static void apply_heartbeat(const cJSON *doc)
         for (char *c = tl_prompt; *c; c++) if (*c == ',') *c = ' ';
     }
     xSemaphoreGive(g_state_mux);
+
+    g_state_generation++;
 
     if (was_disconnected) {
         translog_append("conn", "");
@@ -467,6 +470,7 @@ static void bridge_task(void *arg)
         if (g_state.connected &&
             (millis() - g_state.last_updated_ms) > DATA_TIMEOUT_MS) {
             g_state.connected = false;
+            g_state_generation++;
             just_went_stale = true;
             ESP_LOGW(TAG, "heartbeat stale (>30s) - marked disconnected");
         }
@@ -519,6 +523,11 @@ void bridge_init(void)
     }
 
     ESP_LOGI(TAG, "bridge up (petname='%s', owner='%s')", g_petname, g_ownername);
+}
+
+uint32_t bridge_get_generation(void)
+{
+    return g_state_generation;
 }
 
 void bridge_get_state(tama_state_t *out)

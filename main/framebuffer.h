@@ -21,7 +21,9 @@
 
 #define FB_W       240
 #define FB_H       240
-#define FB_BAND_H  120          // 240 / 2 bands
+#define FB_BAND_H  24           // 240 / 10 bands; two DMA-capable buffers at this
+                                // height cost 2 × 11 520 B = 23 040 B total, down
+                                // from the previous single 57 600 B allocation.
 #define FB_BANDS   (FB_H / FB_BAND_H)
 
 // Allocate the band buffer (heap_caps, internal DRAM). Once at boot,

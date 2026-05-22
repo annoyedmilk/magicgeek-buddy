@@ -57,6 +57,11 @@ typedef enum {
 // render loop must never block on RX.
 void bridge_init(void);
 
+// Monotonically incrementing counter; bumped whenever the bridge state
+// changes (heartbeat received, stale timeout). Use this to skip the full
+// struct copy when nothing has changed since the last call.
+uint32_t bridge_get_generation(void);
+
 // Snapshot of the latest state. Copied (not aliased) so callers can read
 // safely from any task. The render loop polls this at frame rate.
 void bridge_get_state(tama_state_t *out);

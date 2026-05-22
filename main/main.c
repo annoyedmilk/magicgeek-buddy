@@ -505,6 +505,9 @@ static void buddy_task(void *arg)
     persona_state_t last_persona = (persona_state_t)-1;
     char last_prompt_id[40] = "";
 
+    tama_state_t s = {0};
+    uint32_t last_bridge_gen = 0;
+
     // One-shot CELEBRATE override on level-up. Holds for ~3s like the
     // source's triggerOneShot(P_CELEBRATE, 3000).
     uint32_t celebrate_until_ms = 0;
@@ -518,10 +521,14 @@ static void buddy_task(void *arg)
     uint32_t next_anim_ms = 0;
 
     while (1) {
-        // Snapshot the bridge state ONCE per tick so we render a coherent
-        // frame (otherwise compose() could see partly-updated fields).
-        tama_state_t s;
-        bridge_get_state(&s);
+        // Snapshot the bridge state only when something changed. The
+        // generation counter is bumped on every heartbeat and stale timeout,
+        // so a quiet period (no new heartbeats) skips the mutex+800-byte copy.
+        uint32_t gen = bridge_get_generation();
+        if (gen != last_bridge_gen) {
+            bridge_get_state(&s);
+            last_bridge_gen = gen;
+        }
 
         // Edge-trigger the celebrate one-shot on a level-up event.
         if (stats_poll_level_up()) {
