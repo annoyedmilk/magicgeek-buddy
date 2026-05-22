@@ -218,6 +218,19 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                          desc.sec_state.authenticated, desc.sec_state.bonded);
             }
             pending_passkey = 0;  // pairing done either way → clear the screen
+
+            // Encryption-change failure means the central's stored LTK is
+            // stale (user wiped the bond on their side, mismatching keys).
+            // The link stays up but NUS chars - flagged WRITE_ENC - are
+            // unusable, leaving us "connected but mute" until either side
+            // drops the conn. Force a clean teardown so the next attempt
+            // re-pairs from scratch. Matches the Espressif reference.
+            if (event->enc_change.status != 0) {
+                ESP_LOGW(TAG, "[ble] enc_change failed (status=%d) - terminating",
+                         event->enc_change.status);
+                ble_gap_terminate(event->enc_change.conn_handle,
+                                  BLE_ERR_REM_USER_CONN_TERM);
+            }
         }
         return 0;
 
@@ -413,11 +426,15 @@ uint32_t ble_passkey(void)
 
 void ble_clear_bonds(void)
 {
-    // Wipe every stored bond. Note this also drops any active bond; the
-    // current link survives until it disconnects, then the next pair
-    // attempt yields a fresh passkey.
+    // Wipe every stored bond, then terminate any active link so it doesn't
+    // sit there encrypted-but-orphaned (NVS LTKs gone, link still trusts
+    // them in stack state). The disconnect handler will re-advertise; the
+    // next pair attempt yields a fresh passkey on both sides.
     int rc = ble_store_util_delete_peer(NULL);    // delete-all variant
     ESP_LOGI(TAG, "[ble] cleared bonds (rc=%d)", rc);
+    if (conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
 }
 
 bool ble_disconnect(void)
@@ -447,7 +464,13 @@ int ble_read(void)
 
 size_t ble_write(const uint8_t *data, size_t len)
 {
-    if (!ble_connected() || !tx_subscribed || tx_val_handle == 0) return 0;
+    // tx_ready = connected + subscribed + encrypted. Between CONNECT and
+    // ENC_CHANGE there's a window where the central may have already
+    // subscribed but the link isn't encrypted yet; notifying in that
+    // window returns BLE_HS_EAUTHEN. Refuse the send up-front so callers
+    // see a clean 0 instead of a partial-send + warning log.
+    if (!ble_connected() || !tx_subscribed || !link_secure ||
+        tx_val_handle == 0) return 0;
 
     // Per-notify max is (MTU - 3). macOS negotiates ~185; cap at 180 to
     // stay clear of stack edge cases. A short delay between chunks lets
