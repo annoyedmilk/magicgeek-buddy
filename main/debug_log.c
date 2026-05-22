@@ -16,7 +16,6 @@
 #include "bridge.h"
 #include "ble_nus.h"
 #include "stats.h"
-#include "translog.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -164,12 +163,6 @@ static const char DEBUG_PAGE[] =
     "<a class='btn' href='/debug/log' target='_blank'>Open raw</a>"
     "</div>"
 
-    "<h2>Transcript log <span class='hint'>(SPIFFS, persists across reboots)</span></h2>"
-    "<pre id='tr'>loading...</pre>"
-    "<div class='row'>"
-    "<a class='btn' href='/debug/transcript' target='_blank'>Open raw CSV</a>"
-    "</div>"
-
     "<h2>Links</h2>"
     "<div class='row'>"
     "<a class='btn' href='/ota'>OTA / factory reset</a>"
@@ -189,13 +182,7 @@ static const char DEBUG_PAGE[] =
     "    $('log').scrollTop=$('log').scrollHeight;"
     "  }catch(e){$('log').textContent='error: '+e}"
     "}"
-    "async function loadTr(){"
-    "  try{const r=await fetch('/debug/transcript');const t=await r.text();"
-    "    $('tr').textContent=t||'(empty)';"
-    "    $('tr').scrollTop=$('tr').scrollHeight;"
-    "  }catch(e){$('tr').textContent='error: '+e}"
-    "}"
-    "function refresh(){loadStatus();loadLog();loadTr()}"
+    "function refresh(){loadStatus();loadLog()}"
     "refresh();"
     "setInterval(()=>{if($('auto').checked)refresh()},3000);"
     "</script></body></html>";
@@ -269,9 +256,7 @@ static esp_err_t debug_status_handler(httpd_req_t *req)
         "\n"
         "stats lvl     %u\n"
         "approvals     %u\n"
-        "denials       %u\n"
-        "\n"
-        "translog      %s\n",
+        "denials       %u\n",
         APP_VERSION,
         (unsigned long)(up_s / 3600), (unsigned long)((up_s / 60) % 60), (unsigned long)(up_s % 60),
         (unsigned)esp_get_free_heap_size(),
@@ -288,33 +273,22 @@ static esp_err_t debug_status_handler(httpd_req_t *req)
         st.msg[0] ? st.msg : "(none)",
         sg->level,
         sg->approvals,
-        sg->denials,
-        translog_status_str()
+        sg->denials
     );
     if (n < 0) n = 0;
     return httpd_resp_send(req, body, n);
 }
 
-static esp_err_t debug_transcript_handler(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "text/plain; charset=utf-8");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=transcript.csv");
-    return translog_dump_http(req);
-}
-
 esp_err_t debug_log_register_routes(httpd_handle_t server)
 {
     if (!server) return ESP_FAIL;
-    httpd_uri_t r1 = { .uri = "/debug",            .method = HTTP_GET, .handler = debug_page_handler };
-    httpd_uri_t r2 = { .uri = "/debug/log",        .method = HTTP_GET, .handler = debug_log_handler };
-    httpd_uri_t r3 = { .uri = "/debug/status",     .method = HTTP_GET, .handler = debug_status_handler };
-    httpd_uri_t r4 = { .uri = "/debug/transcript", .method = HTTP_GET, .handler = debug_transcript_handler };
+    httpd_uri_t r1 = { .uri = "/debug",        .method = HTTP_GET, .handler = debug_page_handler };
+    httpd_uri_t r2 = { .uri = "/debug/log",    .method = HTTP_GET, .handler = debug_log_handler };
+    httpd_uri_t r3 = { .uri = "/debug/status", .method = HTTP_GET, .handler = debug_status_handler };
     esp_err_t e1 = httpd_register_uri_handler(server, &r1);
     esp_err_t e2 = httpd_register_uri_handler(server, &r2);
     esp_err_t e3 = httpd_register_uri_handler(server, &r3);
-    esp_err_t e4 = httpd_register_uri_handler(server, &r4);
-    if (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK && e4 == ESP_OK) {
+    if (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK) {
         return ESP_OK;
     }
     return ESP_FAIL;

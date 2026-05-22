@@ -32,9 +32,8 @@ size_t debug_log_snapshot_at(size_t skip, char *out, size_t cap);
 size_t debug_log_used(void);
 
 // Register HTTP routes on the shared httpd:
-//   GET /debug             - HTML status page with live log + transcript
+//   GET /debug             - HTML status page with live log
 //   GET /debug/log         - text/plain dump of the in-RAM log ring
-//   GET /debug/transcript  - text/plain dump of the flash transcript ring
 //   GET /debug/status      - text/plain one-shot device snapshot (heap,
 //                            uptime, version, BLE state, last heartbeat)
 //

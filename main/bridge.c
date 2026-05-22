@@ -13,7 +13,6 @@
 #include "ble_nus.h"
 #include "storage.h"
 #include "stats.h"
-#include "translog.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -191,17 +190,6 @@ static void apply_heartbeat(const cJSON *doc)
             strncpy(g_last_seen_prompt_id, g_state.prompt_id,
                     sizeof(g_last_seen_prompt_id) - 1);
             g_last_seen_prompt_id[sizeof(g_last_seen_prompt_id) - 1] = 0;
-            // Log on the prompt-id transition only (not every heartbeat
-            // that keeps carrying the same waiting prompt). Tool name
-            // commas would corrupt CSV; replace before formatting.
-            char tool[48];
-            strncpy(tool, g_state.prompt_tool[0] ? g_state.prompt_tool : "?",
-                    sizeof(tool) - 1);
-            tool[sizeof(tool) - 1] = 0;
-            for (char *c = tool; *c; c++) if (*c == ',') *c = ' ';
-            char ex[80];
-            snprintf(ex, sizeof(ex), ",,,,%s", tool);
-            translog_append("prompt", ex);
         }
     } else {
         g_state.prompt_id[0] = g_state.prompt_tool[0] = g_state.prompt_hint[0] = 0;
@@ -209,44 +197,11 @@ static void apply_heartbeat(const cJSON *doc)
         g_prompt_arrived_ms = 0;
     }
 
-    bool was_disconnected = !g_state.connected;
     g_state.last_updated_ms = millis();
     g_state.connected = true;
-
-    // Snapshot fields needed for the translog row before releasing the
-    // mutex - keeps the file write off the critical section.
-    uint8_t  tl_total = g_state.sessions_total;
-    uint8_t  tl_run   = g_state.sessions_running;
-    uint8_t  tl_wait  = g_state.sessions_waiting;
-    uint32_t tl_tok   = g_state.tokens_today;
-    char     tl_prompt[40]; tl_prompt[0] = 0;
-    if (g_state.prompt_id[0]) {
-        strncpy(tl_prompt, g_state.prompt_tool, sizeof(tl_prompt) - 1);
-        tl_prompt[sizeof(tl_prompt) - 1] = 0;
-        // Strip commas from the tool name so the CSV row stays valid.
-        for (char *c = tl_prompt; *c; c++) if (*c == ',') *c = ' ';
-    }
     xSemaphoreGive(g_state_mux);
 
     g_state_generation++;
-
-    if (was_disconnected) {
-        translog_append("conn", "");
-    }
-    // Throttle the routine "hb" row to one per 10 s. Events (prompt,
-    // approve, deny, conn, disconn, stale) write immediately - heartbeats
-    // are only valuable as a sparse "things were OK at this timestamp"
-    // sample, and the file fopen/fwrite churn isn't free.
-    static uint32_t s_last_hb_log_ms = 0;
-    uint32_t now_ms = millis();
-    if ((uint32_t)(now_ms - s_last_hb_log_ms) >= 10000) {
-        s_last_hb_log_ms = now_ms;
-        char extras[128];
-        snprintf(extras, sizeof(extras), "%u,%u,%u,%lu,%s",
-                 tl_total, tl_run, tl_wait, (unsigned long)tl_tok,
-                 tl_prompt[0] ? tl_prompt : "");
-        translog_append("hb", extras);
-    }
     return;
 }
 
@@ -505,7 +460,6 @@ static void bridge_task(void *arg)
         }
         xSemaphoreGive(g_state_mux);
         if (just_went_stale) {
-            translog_append("stale", "");
             // Recovery: if BLE is up but heartbeats stopped, the Mac's
             // CoreBluetooth client has desynchronized from the Claude
             // desktop app's view of the link (observed: app shows
@@ -514,7 +468,6 @@ static void bridge_task(void *arg)
             // our side gets both stacks to resync from scratch.
             if (ble_connected()) {
                 ESP_LOGW(TAG, "stale + link still up - forcing BLE disconnect");
-                translog_append("force_disc", "");
                 ble_disconnect();
             }
         }
@@ -541,15 +494,6 @@ void bridge_init(void)
     // the canary bytes (0xa5a5a5a5) showed up in main_task's backtrace,
     // which only happens when another task overflows into the TCB region.
     xTaskCreate(bridge_task, "bridge", 8192, NULL, 5, NULL);
-
-    // Translog (SPIFFS): non-fatal if mount fails - logging just no-ops.
-    // Mounting here keeps the bridge as the sole owner of the translog
-    // lifecycle, since it's also the only producer.
-    if (translog_init() == ESP_OK) {
-        translog_append("boot", "");
-    } else {
-        ESP_LOGW(TAG, "translog disabled - SPIFFS mount failed");
-    }
 
     ESP_LOGI(TAG, "bridge up (petname='%s', owner='%s')", g_petname, g_ownername);
 }
@@ -625,8 +569,4 @@ void bridge_send_permission(bool allow)
     else       stats_on_denial();
     ESP_LOGI(TAG, "permission %s for %s (took %lus)",
              allow ? "approved" : "denied", id, (unsigned long)took_s);
-
-    char ex[24];
-    snprintf(ex, sizeof(ex), ",,,,%lus", (unsigned long)took_s);
-    translog_append(allow ? "approve" : "deny", ex);
 }

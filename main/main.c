@@ -43,7 +43,6 @@
 #include "ota_server.h"
 #include "app_version.h"
 #include "debug_log.h"
-#include "translog.h"
 
 static const char *TAG = "buddy";
 
