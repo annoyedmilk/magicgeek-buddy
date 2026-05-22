@@ -66,6 +66,12 @@ static inline uint32_t millis(void) {
 #define LINE_CAP 4608
 static char g_line[LINE_CAP];
 static size_t g_line_len = 0;
+// Set when the in-progress line exceeded LINE_CAP. We then discard every
+// subsequent byte until the next '\n' so we don't restart line assembly
+// in the middle of a garbage payload (the v0.3.1 path reset g_line_len
+// to 0 and accepted the next char as the start of a "new" line, which
+// could corrupt the next several reads). Cleared at the newline.
+static bool g_line_dropping = false;
 
 // One-shot edge for `{"evt":"turn"}`. Set by apply_json on a fresh turn
 // event, consumed by bridge_poll_turn (the render loop polls it once per
@@ -254,21 +260,26 @@ static void ack_ok(const char *cmd) {
     send_line(buf);
 }
 
-// Reject a folder-push command with a clear error. The desktop surfaces
-// the `error` string as a toast in the Hardware Buddy window. We no
-// longer support GIF character packs on this hardware (the AnimatedGIF
-// LZW init wouldn't fit our heap budget without smashing the bridge
-// task stack), so every step of the folder-push protocol is rejected
-// up-front instead of being silently ignored.
-static void ack_unsupported(const char *cmd)
+// Spec-defined error tokens (see Espressif esp_desktop_buddy reference).
+// The desktop branches on these strings, so they must match exactly.
+#define ERR_UNSUPPORTED      "unsupported"
+#define ERR_UNKNOWN_COMMAND  "unknown_command"
+#define ERR_INVALID_REQUEST  "invalid_request"
+
+static void ack_err(const char *cmd, const char *token)
 {
-    char buf[112];
+    char buf[96];
     snprintf(buf, sizeof(buf),
-             "{\"ack\":\"%s\",\"ok\":false,\"n\":0,"
-             "\"error\":\"character packs not supported on this hardware\"}",
-             cmd);
+             "{\"ack\":\"%s\",\"ok\":false,\"n\":0,\"error\":\"%s\"}",
+             cmd, token);
     send_line(buf);
 }
+
+// Reject a folder-push step. GIF character packs are not supported on
+// this hardware (AnimatedGIF LZW init wouldn't fit the heap budget
+// without smashing the bridge task stack). Uses the spec "unsupported"
+// token so the desktop's Hardware Buddy toast can branch on it.
+static void ack_unsupported(const char *cmd) { ack_err(cmd, ERR_UNSUPPORTED); }
 
 static void ack_status(void)
 {
@@ -311,19 +322,17 @@ static bool dispatch(const cJSON *doc)
     }
     if (strcmp(cmd, "name") == 0) {
         const char *n = json_str(doc, "name");
-        if (n) {
-            safe_copy(g_petname, sizeof(g_petname), n);
-            storage_set_str("petname", g_petname);
-        }
+        if (!n) { ack_err("name", ERR_INVALID_REQUEST); return true; }
+        safe_copy(g_petname, sizeof(g_petname), n);
+        storage_set_str("petname", g_petname);
         ack_ok("name");
         return true;
     }
     if (strcmp(cmd, "owner") == 0) {
         const char *n = json_str(doc, "name");
-        if (n) {
-            safe_copy(g_ownername, sizeof(g_ownername), n);
-            storage_set_str("owner", g_ownername);
-        }
+        if (!n) { ack_err("owner", ERR_INVALID_REQUEST); return true; }
+        safe_copy(g_ownername, sizeof(g_ownername), n);
+        storage_set_str("owner", g_ownername);
         ack_ok("owner");
         return true;
     }
@@ -335,11 +344,11 @@ static bool dispatch(const cJSON *doc)
 
     // ─── Folder push protocol (REFERENCE.md "Folder push") ───────────
     // GIF character packs are NOT supported on this hardware. We reject
-    // char_begin up-front with a clean error so the desktop's Hardware
-    // Buddy window surfaces a useful toast instead of timing out. The
-    // subsequent file/chunk/file_end/char_end can't happen if char_begin
-    // is rejected, but ack them defensively in case a future desktop
-    // build sends them anyway.
+    // char_begin up-front with the spec "unsupported" token so the
+    // desktop's Hardware Buddy toast can branch on it. The subsequent
+    // file/chunk/file_end/char_end can't happen if char_begin is
+    // rejected, but ack them defensively in case a future desktop build
+    // sends them anyway.
     if (strcmp(cmd, "char_begin") == 0 ||
         strcmp(cmd, "file")       == 0 ||
         strcmp(cmd, "chunk")      == 0 ||
@@ -348,7 +357,20 @@ static bool dispatch(const cJSON *doc)
         ack_unsupported(cmd);
         return true;
     }
-    return false;
+
+    // Inbound `permission` command from the desktop: the protocol uses
+    // the same token for our outbound permission reply. Match the
+    // Espressif reference and swallow it silently rather than letting
+    // it fall through to apply_heartbeat (which would corrupt
+    // tama_state_t by treating the command shape as a malformed hb).
+    if (strcmp(cmd, "permission") == 0) return true;
+
+    // Any other command: spec says ack with the unknown_command token
+    // so the desktop sees explicit rejection instead of timing out.
+    // Without this, the line falls through to apply_heartbeat as a
+    // {cmd:...} object and silently zeros tama_state_t.
+    ack_err(cmd, ERR_UNKNOWN_COMMAND);
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -440,7 +462,7 @@ static void bridge_task(void *arg)
             int b = ble_read();
             if (b < 0) break;
             if (b == '\n' || b == '\r') {
-                if (g_line_len > 0) {
+                if (!g_line_dropping && g_line_len > 0) {
                     g_line[g_line_len] = 0;
                     if (g_line[0] == '{') {
                         // RX trace at DEBUG (kept for OTA diagnostics).
@@ -450,17 +472,22 @@ static void bridge_task(void *arg)
                                  strlen(g_line) > 120 ? "..." : "");
                         apply_json(g_line);
                     }
-                    g_line_len = 0;
                 }
+                g_line_len = 0;
+                g_line_dropping = false;
+            } else if (g_line_dropping) {
+                // Already dropping this oversized line - keep eating
+                // bytes until '\n' without resuming line assembly.
             } else if (g_line_len < LINE_CAP - 1) {
                 g_line[g_line_len++] = (char)b;
             } else {
-                // Overflow - drop the partial line. LINE_CAP is 4608
-                // (above the spec's 4 KB cap on turn events), so this
-                // path is unreachable for any spec-compliant peer; if
-                // it ever fires, the desktop is sending oversized JSON.
-                ESP_LOGW(TAG, "rx line overflow, dropped");
-                g_line_len = 0;
+                // Overflow - LINE_CAP is 4608 (above the spec's 4 KB
+                // cap on turn events), so this path is unreachable for
+                // any spec-compliant peer. Latch dropping=true; the
+                // rest of the line is discarded so we don't restart
+                // line assembly mid-garbage.
+                ESP_LOGW(TAG, "rx line overflow, dropping until newline");
+                g_line_dropping = true;
             }
         }
 
