@@ -43,6 +43,7 @@
 #include "ota_server.h"
 #include "app_version.h"
 #include "debug_log.h"
+#include "net_trust.h"
 
 static const char *TAG = "buddy";
 
@@ -558,6 +559,20 @@ static void buddy_task(void *arg)
             scr = (wst == WIFI_STATE_ONLINE) ? SCR_WIFI_ONLINE : SCR_WIFI_PORTAL;
         }
 
+        // Trust-prompt: net_trust arms a "pending" flag whenever the STA
+        // joins an unknown network. The ui module owns the prompt UI; we
+        // just open it on the edge with the AP we're currently on. The
+        // prompt overlay layers over whatever home screen is up - we
+        // don't switch `scr`, just let ui_compose_overlay() paint on top.
+        if (net_trust_prompt_pending()) {
+            uint8_t  bssid[6];
+            char     ssid[33];
+            if (net_trust_current_ap(bssid, ssid, sizeof(ssid))) {
+                ui_open_trust_prompt(bssid, ssid);
+            }
+            net_trust_prompt_consumed();
+        }
+
         // Redraw triggers: screen changed, passkey digits changed, new
         // prompt id, persona changed, transcript content changed (for
         // future entries[] rendering - kept now so msg/counts refresh).
@@ -743,6 +758,7 @@ void app_main(void)
     ESP_ERROR_CHECK(storage_init_nvs());
     stats_load();
     settings_load();
+    net_trust_init();
 
     display_init();
     display_fill_color(COLOR_CLAUDE_BG);

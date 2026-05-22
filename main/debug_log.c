@@ -16,6 +16,7 @@
 #include "bridge.h"
 #include "ble_nus.h"
 #include "stats.h"
+#include "net_trust.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -187,8 +188,20 @@ static const char DEBUG_PAGE[] =
     "setInterval(()=>{if($('auto').checked)refresh()},3000);"
     "</script></body></html>";
 
+// Network-trust gate. /debug* needs READONLY; if the current STA AP
+// isn't trusted at least that far, return 404 (not 401/403) so an
+// untrusted LAN peer can't even confirm the device exists. AP-mode
+// (captive portal) bypasses the gate via net_trust_allows().
+static esp_err_t gate_or_404(httpd_req_t *req, net_trust_level_t required)
+{
+    if (net_trust_allows(required)) return ESP_OK;
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+}
+
 static esp_err_t debug_page_handler(httpd_req_t *req)
 {
+    if (gate_or_404(req, NET_TRUST_READONLY) != ESP_OK) return ESP_OK;
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, DEBUG_PAGE, sizeof(DEBUG_PAGE) - 1);
 }
@@ -201,6 +214,7 @@ static esp_err_t debug_page_handler(httpd_req_t *req)
 // chunk boundary might split a line. Fine for a debug endpoint.
 static esp_err_t debug_log_handler(httpd_req_t *req)
 {
+    if (gate_or_404(req, NET_TRUST_READONLY) != ESP_OK) return ESP_OK;
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
@@ -224,6 +238,7 @@ static esp_err_t debug_log_handler(httpd_req_t *req)
 
 static esp_err_t debug_status_handler(httpd_req_t *req)
 {
+    if (gate_or_404(req, NET_TRUST_READONLY) != ESP_OK) return ESP_OK;
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 

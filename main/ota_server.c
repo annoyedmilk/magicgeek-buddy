@@ -10,6 +10,7 @@
 #include "wifi_manager.h"
 #include "stats.h"
 #include "ble_nus.h"
+#include "net_trust.h"
 #include <string.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
@@ -166,14 +167,26 @@ static const char OTA_PAGE[] =
     "xhr.send()};"
     "</script></body></html>";
 
+// /ota* needs ADMIN trust. On non-admin networks we return 404 so the
+// device appears not to exist - the same shape as /debug* on untrusted
+// networks. AP/captive-portal mode bypasses the gate.
+static esp_err_t ota_gate_or_404(httpd_req_t *req)
+{
+    if (net_trust_allows(NET_TRUST_ADMIN)) return ESP_OK;
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+}
+
 static esp_err_t ota_get_handler(httpd_req_t *req)
 {
+    if (ota_gate_or_404(req) != ESP_OK) return ESP_OK;
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, OTA_PAGE, sizeof(OTA_PAGE) - 1);
 }
 
 static esp_err_t ota_post_handler(httpd_req_t *req)
 {
+    if (ota_gate_or_404(req) != ESP_OK) return ESP_OK;
     esp_ota_handle_t ota_handle = 0;
     const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
     if (!update_partition) {
@@ -264,6 +277,7 @@ static void reboot_task(void *arg)
 // already more friction than the touch UI's 5-second arm window.
 static esp_err_t ota_reset_handler(httpd_req_t *req)
 {
+    if (ota_gate_or_404(req) != ESP_OK) return ESP_OK;
     ESP_LOGW(TAG, "factory reset requested via /ota/reset - wiping");
     stats_factory_reset();
     ble_clear_bonds();

@@ -248,8 +248,13 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             int rc = ble_sm_inject_io(event->passkey.conn_handle, &io);
             if (rc == 0) {
                 pending_passkey = pk;
-                ESP_LOGI(TAG, "[ble] passkey %06lu - enter on desktop",
-                         (unsigned long)pk);
+                // Defense in depth: never log the passkey digits. It's on
+                // the device's own display (the source of truth); putting
+                // it in the in-RAM log ring meant /debug/log leaked the
+                // active pair window to any LAN peer with HTTP access.
+                // The trust gate already hides /debug, but the device UX
+                // is the only place this value belongs.
+                ESP_LOGI(TAG, "[ble] passkey ****** - see device screen");
             } else {
                 ESP_LOGE(TAG, "[ble] ble_sm_inject_io failed: %d", rc);
             }

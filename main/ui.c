@@ -11,6 +11,7 @@
 #include "ble_nus.h"
 #include "wifi_manager.h"
 #include "stats.h"
+#include "net_trust.h"
 #include <string.h>
 #include <stdio.h>
 #include "esp_log.h"
@@ -44,6 +45,13 @@ static uint8_t    g_sel      = 0;       // highlighted menu item
 static uint8_t    g_arm_idx  = 0xFF;    // armed confirm target (M_FACTORY_RESET)
 static uint32_t   g_arm_until_ms = 0;   // confirm window deadline
 static bool       g_dirty    = false;   // forces redraw on state change
+
+// Trust prompt context: captured when we open UI_TRUST_PROMPT so the
+// user's gesture commits the decision against the right BSSID even if
+// the device roams to a new AP in the meantime.
+static uint8_t  g_trust_bssid[6];
+static char     g_trust_ssid[33];
+static uint32_t g_trust_until_ms = 0;   // 60s timeout = deny
 
 static inline uint32_t now_ms(void) {
     return (uint32_t)(esp_timer_get_time() / 1000);
@@ -224,6 +232,53 @@ static void compose_reset_confirm(void)
                     COLOR_CLAUDE_DIM, PANEL_COLOR, 1);
 }
 
+static void compose_trust_prompt(void)
+{
+    const int W = 224, H = 180;
+    const int X = (DISPLAY_WIDTH - W) / 2;
+    const int Y = (DISPLAY_HEIGHT - H) / 2;
+    draw_panel_frame(X, Y, W, H, COLOR_CLAUDE_CORAL);
+
+    gfx_text_center(Y + 12, "NEW NETWORK", COLOR_CLAUDE_CORAL, PANEL_COLOR, 1);
+    gfx_fill_rect(X + 12, Y + 26, W - 24, 1, COLOR_CLAUDE_DIM);
+
+    // SSID (truncate if it doesn't fit one line at scale 1; 26 chars wide).
+    char ssid_disp[27];
+    size_t n = strnlen(g_trust_ssid, sizeof(g_trust_ssid));
+    if (n > sizeof(ssid_disp) - 1) n = sizeof(ssid_disp) - 1;
+    memcpy(ssid_disp, g_trust_ssid, n);
+    ssid_disp[n] = 0;
+    gfx_text_center(Y + 36, ssid_disp, COLOR_CLAUDE_PAPER, PANEL_COLOR, 1);
+
+    // BSSID (XX:XX:XX:XX:XX:XX, dimmer so it reads as metadata).
+    char bssid_disp[24];
+    snprintf(bssid_disp, sizeof(bssid_disp),
+             "%02x:%02x:%02x:%02x:%02x:%02x",
+             g_trust_bssid[0], g_trust_bssid[1], g_trust_bssid[2],
+             g_trust_bssid[3], g_trust_bssid[4], g_trust_bssid[5]);
+    gfx_text_center(Y + 50, bssid_disp, COLOR_CLAUDE_DIM, PANEL_COLOR, 1);
+
+    gfx_text_center(Y + 72, "Trust this network?",
+                    COLOR_CLAUDE_PAPER, PANEL_COLOR, 1);
+
+    // Three-option footer. Layout mirrors compose_prompt's TAP/DOUBLE
+    // pattern (main.c uses the same gestures everywhere on this device).
+    gfx_text_center(Y + 96,  "TAP    read-only",
+                    COLOR_GREEN,         PANEL_COLOR, 1);
+    gfx_text_center(Y + 112, "DOUBLE admin",
+                    COLOR_CLAUDE_CORAL,  PANEL_COLOR, 1);
+    gfx_text_center(Y + 128, "LONG   deny",
+                    COLOR_RED,           PANEL_COLOR, 1);
+
+    // Countdown so the user knows the prompt isn't going to sit forever.
+    int32_t remain = (int32_t)(g_trust_until_ms - now_ms());
+    if (remain < 0) remain = 0;
+    char buf[28];
+    snprintf(buf, sizeof(buf), "auto-deny in %lus",
+             (unsigned long)((remain + 999) / 1000));
+    gfx_text_center(Y + H - 14, buf, COLOR_CLAUDE_DIM, PANEL_COLOR, 1);
+}
+
 void ui_compose_overlay(void)
 {
     switch (g_state) {
@@ -231,6 +286,18 @@ void ui_compose_overlay(void)
     case UI_MENU:          compose_menu();          break;
     case UI_INFO:          compose_info();          break;
     case UI_RESET_CONFIRM: compose_reset_confirm(); break;
+    case UI_TRUST_PROMPT:  compose_trust_prompt();  break;
+    }
+
+    // Trust-prompt timeout: handled here (in the compose path) because
+    // ui_poll_dirty is consulted on every frame regardless of state, and
+    // the prompt has a countdown that the user can ignore.
+    if (g_state == UI_TRUST_PROMPT &&
+        (int32_t)(g_trust_until_ms - now_ms()) <= 0) {
+        net_trust_store(g_trust_bssid, g_trust_ssid, NET_TRUST_DENY);
+        ESP_LOGW(TAG, "trust prompt timed out -> deny");
+        g_state = UI_NORMAL;
+        g_dirty = true;
     }
 }
 
@@ -293,8 +360,23 @@ static void menu_activate_current(void)
     }
 }
 
+// Commit a trust decision against the captured (bssid, ssid) and close
+// the prompt. Used by all three gesture handlers below; centralizing
+// the store + reset keeps the gestures terse.
+static void trust_commit(net_trust_level_t lvl)
+{
+    net_trust_store(g_trust_bssid, g_trust_ssid, lvl);
+    g_state = UI_NORMAL;
+    g_dirty = true;
+}
+
 bool ui_on_tap(void)
 {
+    if (g_state == UI_TRUST_PROMPT) {
+        ESP_LOGI(TAG, "trust prompt -> READONLY for '%s'", g_trust_ssid);
+        trust_commit(NET_TRUST_READONLY);
+        return true;
+    }
     if (g_state == UI_MENU) {
         g_sel = (uint8_t)((g_sel + 1) % M_COUNT);
         g_dirty = true;
@@ -307,6 +389,11 @@ bool ui_on_tap(void)
 
 bool ui_on_double_tap(void)
 {
+    if (g_state == UI_TRUST_PROMPT) {
+        ESP_LOGW(TAG, "trust prompt -> ADMIN for '%s'", g_trust_ssid);
+        trust_commit(NET_TRUST_ADMIN);
+        return true;
+    }
     if (g_state == UI_MENU) {
         menu_activate_current();
         return true;
@@ -335,6 +422,11 @@ bool ui_on_double_tap(void)
 
 bool ui_on_long_press(void)
 {
+    if (g_state == UI_TRUST_PROMPT) {
+        ESP_LOGW(TAG, "trust prompt -> DENY for '%s'", g_trust_ssid);
+        trust_commit(NET_TRUST_DENY);
+        return true;
+    }
     // LONG is the universal "back / open menu" gesture.
     if (g_state == UI_NORMAL) {
         open_menu();
@@ -352,4 +444,19 @@ bool ui_on_long_press(void)
         return true;
     }
     return false;
+}
+
+void ui_open_trust_prompt(const uint8_t bssid[6], const char *ssid)
+{
+    if (!bssid || !ssid) return;
+    memcpy(g_trust_bssid, bssid, 6);
+    size_t n = strnlen(ssid, sizeof(g_trust_ssid));
+    if (n >= sizeof(g_trust_ssid)) n = sizeof(g_trust_ssid) - 1;
+    memcpy(g_trust_ssid, ssid, n);
+    g_trust_ssid[n] = 0;
+
+    g_trust_until_ms = now_ms() + 60000;   // 60s before auto-deny
+    g_state = UI_TRUST_PROMPT;
+    g_dirty = true;
+    ESP_LOGI(TAG, "trust prompt opened for '%s'", g_trust_ssid);
 }

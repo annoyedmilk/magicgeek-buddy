@@ -17,6 +17,7 @@ idf_component_register(SRCS "main.c"
                             "ui.c"
                             "ota_server.c"
                             "debug_log.c"
+                            "net_trust.c"
                     INCLUDE_DIRS "."
                     REQUIRES driver esp_driver_spi esp_driver_gpio
                              esp_driver_ledc esp_driver_touch_sens

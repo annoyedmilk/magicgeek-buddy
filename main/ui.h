@@ -15,6 +15,7 @@ typedef enum {
     UI_MENU,             // top-level menu panel
     UI_INFO,             // info / about page (no submenu items)
     UI_RESET_CONFIRM,    // "really?" two-step before factory reset
+    UI_TRUST_PROMPT,     // new WiFi joined - user picks trust level
 } ui_state_t;
 
 // Initialize internal state. Call once at boot, after stats_load().
@@ -43,3 +44,10 @@ bool ui_on_long_press(void);
 // since the last poll. The render loop reads this to know whether the
 // overlay needs a redraw without us bumping a counter.
 bool ui_poll_dirty(void);
+
+// Open the trust prompt for a newly-joined network. Called from the
+// render loop when net_trust_prompt_pending() goes true. The captured
+// bssid/ssid are stored so the user's gesture commits against the AP
+// they actually saw on the screen, even if a roam happens before they
+// respond. 60s timeout auto-commits NET_TRUST_DENY.
+void ui_open_trust_prompt(const uint8_t bssid[6], const char *ssid);

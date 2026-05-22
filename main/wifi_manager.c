@@ -11,6 +11,7 @@
 //     back into captive-portal mode.
 #include "wifi_manager.h"
 #include "storage.h"
+#include "net_trust.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,6 +81,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         connected = true;
         retry_count = 0;
         xEventGroupSetBits(wifi_events, WIFI_CONNECTED_BIT);
+
+        // Resolve trust for the joined AP. esp_wifi_sta_get_ap_info is
+        // safe to call here: GOT_IP only fires after the link is fully
+        // up, so the AP record is populated. For an unknown network this
+        // arms net_trust_prompt_pending; the render loop picks it up and
+        // opens UI_TRUST_PROMPT. HTTP routes stay 404 until then.
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            char ssid[33] = {0};
+            size_t n = strnlen((const char *)ap.ssid, sizeof(ap.ssid));
+            if (n >= sizeof(ssid)) n = sizeof(ssid) - 1;
+            memcpy(ssid, ap.ssid, n);
+            net_trust_on_sta_connect(ap.bssid, ssid);
+        } else {
+            ESP_LOGW(TAG, "could not read AP info for trust check");
+        }
     }
 }
 
