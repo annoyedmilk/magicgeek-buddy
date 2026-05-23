@@ -157,13 +157,17 @@ Claude charcoal `COLOR_CLAUDE_BG`.
 
 ## WiFi behavior
 
-WiFi is secondary to the BLE link. On boot:
+WiFi is optional; the device works fully over BLE without it. On boot:
 
-1. NVS has saved creds, try STA connect in a background task (30 s
-   budget). Success starts the shared httpd in STA mode. Failure
-   falls back to the captive portal.
-2. No creds, start the captive portal directly. SoftAP name is
-   `Buddy-XXYY` from the last two SoftAP MAC bytes.
+1. NVS has saved creds: try STA connect in a background task (30 s
+   budget). Success starts the shared httpd in STA mode. Failure →
+   BLE-only (no portal fallback).
+2. No creds: BLE-only immediately; no captive portal is started.
+
+The captive portal (SoftAP `Buddy-XXYY`) is started exclusively on
+user request via the on-device menu → "setup wifi". This lets the
+device work at coffee shops, friend's houses, etc. without polluting
+the airspace with an AP.
 
 Captive portal page is Claude themed (charcoal `#1F1E1D`, paper
 `#F0EEE6`, coral `#D97757`). The "Forget WiFi" button wipes NVS

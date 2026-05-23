@@ -28,6 +28,8 @@ static const char *TAG = "ui";
 typedef enum {
     M_NEXT_PET,
     M_INFO,
+    M_WIFI_SETUP,
+    M_WIFI_TRUST,
     M_FACTORY_RESET,
     M_CLOSE,
     M_COUNT
@@ -36,6 +38,8 @@ typedef enum {
 static const char *MENU_LABELS[M_COUNT] = {
     "next pet",
     "info / about",
+    "setup wifi",
+    "wifi: set admin",
     "factory reset",
     "close",
 };
@@ -190,11 +194,18 @@ static void compose_info(void)
 
     // wifi
     gfx_text(X + 10, y, "wifi", COLOR_CLAUDE_PAPER, PANEL_COLOR, 1);    y += 12;
-    if (wifi_manager_is_connected()) {
-        char ip[16]; wifi_manager_get_ip_str(ip, sizeof(ip));
-        snprintf(line, sizeof(line), "  online  %s", ip);
-    } else {
-        snprintf(line, sizeof(line), "  setup AP active");
+    {
+        wifi_state_t wst = wifi_manager_state();
+        if (wst == WIFI_STATE_ONLINE) {
+            char ip[16]; wifi_manager_get_ip_str(ip, sizeof(ip));
+            snprintf(line, sizeof(line), "  online  %s", ip);
+        } else if (wst == WIFI_STATE_PORTAL) {
+            snprintf(line, sizeof(line), "  setup AP active");
+        } else if (wst == WIFI_STATE_CONNECTING) {
+            snprintf(line, sizeof(line), "  connecting...");
+        } else {
+            snprintf(line, sizeof(line), "  off");
+        }
     }
     gfx_text(X + 10, y, line, COLOR_CLAUDE_DIM, PANEL_COLOR, 1);        y += 10;
     {
@@ -348,6 +359,20 @@ static void menu_activate_current(void)
         g_state = UI_INFO;
         g_dirty = true;
         break;
+    case M_WIFI_SETUP:
+        wifi_manager_start_portal();
+        close_overlay();
+        break;
+    case M_WIFI_TRUST: {
+        uint8_t bssid[6];
+        char    ssid[33];
+        if (net_trust_current_ap(bssid, ssid, sizeof(ssid))) {
+            net_trust_store(bssid, ssid, NET_TRUST_ADMIN);
+            ESP_LOGI(TAG, "menu: trust for '%s' -> ADMIN", ssid);
+        }
+        close_overlay();
+        break;
+    }
     case M_FACTORY_RESET:
         g_state = UI_RESET_CONFIRM;
         g_arm_until_ms = now_ms() + 5000;   // 5s confirm window

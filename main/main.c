@@ -55,22 +55,6 @@ static const char *TAG = "buddy";
 static uint8_t  g_transcript_scroll = 0;
 static uint16_t g_last_line_gen     = 0;
 
-// Backlight idle-fade. Two-tier:
-//   Tier 1 (dim):  no touch AND no new transcript content for 15 min →
-//                  drop to 30%. Catches "peer alive but nothing's
-//                  happening" - the Claude desktop stays open all day.
-//   Tier 2 (off):  P_SLEEP (no peer at all) AND no touch for 5 min →
-//                  fade to 0. Burn-in protection on the IPS panel.
-// Both timers reset on touch (via on_touch) and on a line_gen bump
-// (heartbeat carried a new transcript line). The DIM timer is reset
-// only when the peer is alive; SLEEP doesn't keep extending it.
-static volatile uint32_t g_last_activity_ms = 0;  // tier-2 (SLEEP) gate
-static volatile uint32_t g_last_dim_reset_ms = 0; // tier-1 (idle peer) gate
-#define BL_IDLE_FADE_AFTER_MS  (5 * 60 * 1000)   // 5 minutes of P_SLEEP
-#define BL_IDLE_DIM_AFTER_MS   (15 * 60 * 1000)  // 15 min idle-with-peer
-#define BL_IDLE_FADE_DURATION_MS 2000            // 2-second envelope
-#define BL_DIM_PERCENT          0                // fade-to-off target
-#define BL_HALF_DIM_PERCENT     30               // tier-1 target
 
 // ─────────────────────────────────────────────────────────────────────
 // Touch routing. Priority (highest first):
@@ -84,13 +68,7 @@ static volatile uint32_t g_last_dim_reset_ms = 0; // tier-1 (idle peer) gate
 // ─────────────────────────────────────────────────────────────────────
 static void on_touch(touch_event_t ev)
 {
-    // Any touch resets BOTH idle timers and snaps the backlight back on.
-    // Even gestures the UI consumes count as activity - the user is
-    // clearly looking at the screen.
-    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    g_last_activity_ms = now;
-    g_last_dim_reset_ms = now;
-    display_set_backlight(100);
+
 
     switch (ev) {
     case TOUCH_EVENT_TAP:
@@ -470,6 +448,21 @@ static void compose_setup(void *ctx)
     ui_compose_overlay();
 }
 
+// Default idle screen: no BLE peer yet, WiFi not active. Tells the user
+// how to pair. WiFi is optional; this screen replaces the old "portal AP"
+// fallback that was shown automatically when no creds were saved.
+static void compose_advertising(void *ctx)
+{
+    (void)ctx;
+    compose_header(COLOR_CLAUDE_CORAL, "Claude Buddy", COLOR_CLAUDE_BG);
+    gfx_text_center(64, "READY", COLOR_CLAUDE_PAPER, COLOR_CLAUDE_BG, 3);
+    gfx_text_center(120, "pair via Bluetooth", COLOR_CLAUDE_DIM, COLOR_CLAUDE_BG, 1);
+    gfx_text_center(136, "in Claude desktop:", COLOR_CLAUDE_DIM, COLOR_CLAUDE_BG, 1);
+    gfx_text_center(158, "Developer > Hardware", COLOR_CLAUDE_DIM, COLOR_CLAUDE_BG, 1);
+    gfx_text_center(174, "Buddy > Connect", COLOR_CLAUDE_DIM, COLOR_CLAUDE_BG, 1);
+    ui_compose_overlay();
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Screen selection by priority.
 // ─────────────────────────────────────────────────────────────────────
@@ -480,6 +473,7 @@ typedef enum {
     SCR_BLE_WAITING,
     SCR_WIFI_ONLINE,
     SCR_WIFI_PORTAL,
+    SCR_ADVERTISING,   // no BLE peer, WiFi off/connecting
 } screen_t;
 
 static void buddy_task(void *arg)
@@ -494,10 +488,6 @@ static void buddy_task(void *arg)
     // that threshold AND WiFi is up (proof the network stack works).
     uint32_t boot_t0_ms = (uint32_t)(esp_timer_get_time() / 1000);
     bool     marked_valid = false;
-    // Seed both idle clocks so we don't dim during the first 5/15 min of
-    // uptime (the user just plugged it in and is watching it).
-    g_last_activity_ms = boot_t0_ms;
-    g_last_dim_reset_ms = boot_t0_ms;
 
     screen_t last = (screen_t)-1;
     uint32_t last_pk = 0;
@@ -556,7 +546,9 @@ static void buddy_task(void *arg)
         else if (ble_connected())           scr = SCR_BLE_WAITING;
         else {
             wifi_state_t wst = wifi_manager_state();
-            scr = (wst == WIFI_STATE_ONLINE) ? SCR_WIFI_ONLINE : SCR_WIFI_PORTAL;
+            if      (wst == WIFI_STATE_ONLINE)  scr = SCR_WIFI_ONLINE;
+            else if (wst == WIFI_STATE_PORTAL)  scr = SCR_WIFI_PORTAL;
+            else                                scr = SCR_ADVERTISING;
         }
 
         // Trust-prompt: net_trust arms a "pending" flag whenever the STA
@@ -640,6 +632,9 @@ static void buddy_task(void *arg)
                 fb_frame(compose_setup, ap);
                 break;
             }
+            case SCR_ADVERTISING:
+                fb_frame(compose_advertising, NULL);
+                break;
             }
             last = scr;
             last_pk = pk;
@@ -666,75 +661,12 @@ static void buddy_task(void *arg)
             }
         }
 
-        // Rollback cancel: after 3 s of running with WiFi up, the build
-        // is healthy enough that we let it commit. Earlier and a hang
-        // here wouldn't roll back; later and a clean boot looks unsafe.
-        if (!marked_valid
-            && (now_ms - boot_t0_ms) >= 3000
-            && wifi_manager_get_httpd() != NULL) {
+        // Rollback cancel: 3 s of the render loop running means the device
+        // is alive (BLE up, display up). WiFi is optional so we don't gate
+        // on httpd being ready - a BLE-only build is just as valid.
+        if (!marked_valid && (now_ms - boot_t0_ms) >= 3000) {
             ota_mark_valid();
             marked_valid = true;
-        }
-
-        // ─── Idle backlight fade (burn-in protection) ─────────────────
-        // The ST7789V IPS panel is prone to image retention on long
-        // static fields. Two tiers:
-        //   tier 1: peer alive but nothing happening for 15 min → 30%
-        //   tier 2: P_SLEEP (no peer) for 5 min → 0%
-        // Both reset on touch (via on_touch) and on a new transcript
-        // line (line_gen bump). Tier 2 also resets on any non-SLEEP
-        // persona state since "running sessions" is real activity.
-        {
-            static uint16_t last_bl_line_gen = 0;
-            bool active_ui   = (ui_get_state() != UI_NORMAL);
-            bool peer_alive  = (scr != SCR_PERSONA) || (persona != P_SLEEP);
-            bool new_content = (s.line_gen != last_bl_line_gen);
-            last_bl_line_gen = s.line_gen;
-
-            // Tier 2 (SLEEP→off): resets on any UI activity OR any
-            // non-SLEEP persona. Unchanged semantics from v0.2.0.
-            if (active_ui || peer_alive) {
-                g_last_activity_ms = now_ms;
-            }
-            // Tier 1 (idle-with-peer→dim): resets only on REAL activity
-            // - new transcript content, touch, or active overlay.
-            // Steady-state "BUSY but the same heartbeat" doesn't count.
-            if (active_ui || new_content) {
-                g_last_dim_reset_ms = now_ms;
-            }
-
-            uint32_t idle_for_fade = now_ms - g_last_activity_ms;
-            uint32_t idle_for_dim  = now_ms - g_last_dim_reset_ms;
-            uint8_t  target;
-
-            if (idle_for_fade >= BL_IDLE_FADE_AFTER_MS) {
-                // Tier 2 wins: ramp 100 → BL_DIM_PERCENT (off).
-                uint32_t into_fade = idle_for_fade - BL_IDLE_FADE_AFTER_MS;
-                if (into_fade >= BL_IDLE_FADE_DURATION_MS) {
-                    target = BL_DIM_PERCENT;
-                } else {
-                    uint32_t span = 100u - BL_DIM_PERCENT;
-                    uint32_t drop = (span * into_fade) / BL_IDLE_FADE_DURATION_MS;
-                    target = (uint8_t)(100u - drop);
-                }
-            } else if (idle_for_dim >= BL_IDLE_DIM_AFTER_MS) {
-                // Tier 1: ramp 100 → BL_HALF_DIM_PERCENT (30%).
-                uint32_t into_dim = idle_for_dim - BL_IDLE_DIM_AFTER_MS;
-                if (into_dim >= BL_IDLE_FADE_DURATION_MS) {
-                    target = BL_HALF_DIM_PERCENT;
-                } else {
-                    uint32_t span = 100u - BL_HALF_DIM_PERCENT;
-                    uint32_t drop = (span * into_dim) / BL_IDLE_FADE_DURATION_MS;
-                    target = (uint8_t)(100u - drop);
-                }
-            } else {
-                target = 100;
-            }
-            static uint8_t s_last_target = 100;
-            if (target != s_last_target) {
-                display_set_backlight(target);
-                s_last_target = target;
-            }
         }
 
         // 100 ms tick - gives the persona screen ~5 fps animation room

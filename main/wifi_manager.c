@@ -168,10 +168,10 @@ esp_err_t wifi_manager_connect(int timeout_ms)
 // Background WiFi bring-up. app_main must NEVER block on the connect:
 // esp_wifi auth/retry can take 20-30s and starves the main task, which
 // trips the Task Watchdog (TG1WDT_SYS_RESET) into a boot loop. Instead
-// we start STA, return immediately, and let this task watch the result -
-// falling back to the captive portal on failure. The render loop keeps
-// running (and yielding) the entire time.
-static volatile bool sta_giveup = false;
+// we start STA, return immediately, and let this task watch the result.
+// On failure the device stays in BLE-only mode (no portal fallback).
+static volatile bool sta_giveup     = false;
+static volatile bool portal_started = false;
 
 static void wifi_connect_task(void *arg)
 {
@@ -204,33 +204,36 @@ static void wifi_connect_task(void *arg)
         // mode we DON'T register the captive wildcard catch-all.
         start_shared_httpd(/*ap_mode=*/false);
     } else {
-        ESP_LOGW(TAG, "STA connect failed/timed out - starting captive portal");
+        ESP_LOGW(TAG, "STA connect failed/timed out - continuing BLE-only");
         sta_giveup = true;
         esp_wifi_stop();
-        wifi_manager_start_portal();   // spawns its own task
+        // No portal fallback: the device works fine over BLE without WiFi.
+        // The user can start the captive portal on demand from the menu.
     }
     vTaskDelete(NULL);
 }
 
-// Non-blocking entry point used at boot. Creds present → background
-// STA connect (portal fallback on failure). No creds → portal now.
-// Returns immediately either way.
+// Non-blocking entry point used at boot. Creds present → background STA
+// connect (BLE-only on failure). No creds → BLE-only immediately.
+// The captive portal is never started automatically; use the on-device
+// menu → "setup wifi" if you want to configure a new network.
 void wifi_manager_autostart(void)
 {
     if (wifi_manager_has_creds()) {
         xTaskCreate(wifi_connect_task, "wifi_conn", 4096, NULL, 5, NULL);
     } else {
-        ESP_LOGW(TAG, "No WiFi creds - starting captive portal");
-        wifi_manager_start_portal();
+        ESP_LOGI(TAG, "No WiFi creds - BLE-only mode");
+        sta_giveup = true;   // → WIFI_STATE_DISABLED
     }
 }
 
 // Coarse state for the scaffold status screen.
 wifi_state_t wifi_manager_state(void)
 {
-    if (connected)   return WIFI_STATE_ONLINE;
-    if (sta_giveup)  return WIFI_STATE_PORTAL;
-    return wifi_manager_has_creds() ? WIFI_STATE_CONNECTING : WIFI_STATE_PORTAL;
+    if (connected)      return WIFI_STATE_ONLINE;
+    if (portal_started) return WIFI_STATE_PORTAL;
+    if (sta_giveup)     return WIFI_STATE_DISABLED;
+    return WIFI_STATE_CONNECTING;   // has creds, task running
 }
 
 // --- Captive Portal (Claude-night theme) ---
@@ -524,6 +527,8 @@ static void portal_task(void *arg)
 
 esp_err_t wifi_manager_start_portal(void)
 {
+    portal_started = true;
+    sta_giveup     = false;   // clear so state() sees PORTAL, not DISABLED
     return xTaskCreate(portal_task, "wifi_portal", 4096, NULL, 5, NULL) == pdPASS
         ? ESP_OK : ESP_FAIL;
 }

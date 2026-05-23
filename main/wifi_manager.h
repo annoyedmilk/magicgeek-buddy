@@ -5,9 +5,10 @@
 #include <stddef.h>
 
 // WiFi provisioning. BLE-to-Claude is the buddy's primary link; WiFi is
-// secondary (OTA, future networked features). Flow:
-//   boot → creds in NVS?  yes → STA connect (background)
-//                          no  → SoftAP "Buddy-XXYY" + captive portal
+// optional (OTA, debug endpoint). Flow:
+//   boot → creds in NVS?  yes → STA connect (background); fail → BLE-only
+//                          no  → BLE-only (no captive portal)
+// The portal only starts when the user requests it from the on-device menu.
 // The portal page also has a "Forget WiFi" button that wipes creds and
 // reboots back into setup. Ported from the proven F1 Dashboard firmware.
 
@@ -18,9 +19,10 @@
 esp_err_t wifi_manager_init(void);
 
 typedef enum {
+    WIFI_STATE_DISABLED,     // WiFi not started (no creds, or STA failed without portal)
     WIFI_STATE_CONNECTING,   // creds present, STA bring-up in progress
     WIFI_STATE_ONLINE,       // joined an AP, got an IP
-    WIFI_STATE_PORTAL,       // no creds / connect failed → captive portal
+    WIFI_STATE_PORTAL,       // captive portal AP active (user-triggered)
 } wifi_state_t;
 
 /**
@@ -32,7 +34,8 @@ esp_err_t wifi_manager_connect(int timeout_ms);
 
 /**
  * Non-blocking boot entry point. Creds present → background STA connect
- * (falls back to the captive portal on failure); no creds → portal now.
+ * (stays BLE-only on failure); no creds → BLE-only. Never starts the
+ * captive portal automatically; that is user-triggered via the menu.
  * Returns immediately so the render loop is never starved.
  */
 void wifi_manager_autostart(void);
