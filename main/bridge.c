@@ -386,7 +386,7 @@ static void apply_json(const char *line, size_t line_len)
     // Guard on key existence, not cJSON_IsArray: if the desktop sends
     // {"time": <integer>} (non-array), the array check fails silently
     // and the message falls through to apply_heartbeat, which sets
-    // connected=true and resets last_updated_ms — a false 45 s reprieve
+    // connected=true and resets last_updated_ms, a false 45 s reprieve
     // that creates an exact stale-fire cycle on every reconnect.
     cJSON *time_item = cJSON_GetObjectItemCaseSensitive(doc, "time");
     if (time_item) {
@@ -431,7 +431,7 @@ static void bridge_task(void *arg)
         // desktop gets a clean 45 s slot to send its first heartbeat.
         // Without this, a reconnect after a long idle period would find
         // last_updated_ms already > 45 s old and fire the stale ~50 ms
-        // after connect — before the passkey screen has time to show.
+        // after connect, before the passkey screen has time to show.
         bool now_ble_connected = ble_connected();
         if (!was_ble_connected && now_ble_connected) {
             xSemaphoreTake(g_state_mux, portMAX_DELAY);
@@ -498,7 +498,7 @@ static void bridge_task(void *arg)
             // our side gets both stacks to resync from scratch.
             // Guard on ble_secure(): if the link is not yet encrypted
             // the device is in the middle of a pairing exchange (passkey
-            // on screen). Disconnecting here would kill the pairing —
+            // on screen). Disconnecting here would kill the pairing;
             // the passkey screen would vanish before the user can read it.
             if (ble_connected() && ble_secure()) {
                 ble_arm_stale_delay();

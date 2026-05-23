@@ -37,7 +37,7 @@ static spi_device_handle_t  spi_dev;
 // Only one band transfer is ever in-flight at a time (fb_frame drains
 // before queuing the next), so a single descriptor is sufficient.
 static spi_transaction_t    s_async_trans;
-static bool                 s_async_pending = false;
+static volatile bool        s_async_pending = false;
 
 static void send_cmd(uint8_t cmd)
 {
@@ -68,7 +68,7 @@ static void send_data_byte(uint8_t data)
 void display_init(void)
 {
     // DC + RST are plain GPIO outputs. BACKLIGHT (IO25) is driven by
-    // LEDC so the host can fade for idle dimming / burn-in protection.
+    // LEDC so brightness can be set via display_set_backlight().
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << PIN_DISPLAY_DC)
                       | (1ULL << PIN_DISPLAY_RST),

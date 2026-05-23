@@ -7,8 +7,8 @@
 //
 // Boot order (each step's free heap is logged on serial):
 //   1. NVS + display + touch
-//   2. WiFi (non-blocking; STA if creds saved, captive portal AP otherwise)
-//   3. Framebuffer (240x120 banded, two passes per frame)
+//   2. WiFi (non-blocking; STA if creds saved, BLE-only otherwise)
+//   3. Framebuffer (async DMA ping-pong, 10 bands of 24 rows)
 //   4. BLE NUS (advertises as "Claude-XXXX" with last four MAC hex)
 //   5. bridge (RX line buffer, cJSON parser, state machine)
 //   6. buddy_task (picks a compose callback by priority, runs fb_frame)
@@ -580,7 +580,11 @@ static void buddy_task(void *arg)
         // ALSO: the reset-confirm overlay shows a 1-Hz countdown; force
         // a periodic redraw while it's up so the seconds tick down.
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        bool anim_due = ((scr == SCR_PERSONA) || (ui_get_state() == UI_RESET_CONFIRM))
+        // SCR_BLE_WAITING is included so ui_compose_overlay() runs every
+        // 200ms while paired but idle; without it, the menu silently stays
+        // undrawn if g_dirty was consumed by the scr!=last transition frame.
+        bool anim_due = ((scr == SCR_PERSONA) || (ui_get_state() == UI_RESET_CONFIRM)
+                         || (scr == SCR_BLE_WAITING))
             && (int32_t)(now_ms - next_anim_ms) >= 0;
 
         bool need_redraw = (scr != last)

@@ -98,11 +98,11 @@ void fb_fill_rect(int x, int y, int w, int h, uint16_t color)
 //
 // Ordering within each iteration:
 //   1. Set active_buf to one of the two buffers (alternating).
-//   2. Call draw() — composes this band into active_buf.
+//   2. Call draw(): composes this band into active_buf.
 //   3. Wait for the *previous* band's DMA to finish.
 //      (This is the only potential stall point; if composing took longer
 //      than 4.6 ms the DMA is already done and this returns immediately.)
-//   4. Set the panel window for this band (uses polling SPI — must not
+//   4. Set the panel window for this band (uses polling SPI, must not
 //      race an in-flight DMA, hence the wait above).
 //   5. Queue async DMA for active_buf.
 //   6. Loop: the CPU is now free to compose the next band into the other

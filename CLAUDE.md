@@ -85,7 +85,7 @@ to the transcript scroller on the persona screen.
 main/
   main.c              boot, render loop, screen selection, touch routing
   display.c/.h        ST7789V raw SPI, GPIO25 backlight via LEDC PWM
-  framebuffer.c/.h    240x120 banded RGB565 (about 58 KB), 2 pass flush
+  framebuffer.c/.h    async DMA ping-pong, 10 bands x 24 rows, 23 KB total
   gfx.c/.h            8x8 font, fills, text composing into the FB
   touch_button.c/.h   tap, double tap, long press gestures
   storage.c/.h        NVS key value wrapper
@@ -125,15 +125,17 @@ during development.
 
 ## Render model
 
-Two pass banded framebuffer. `fb_frame(compose_callback, ctx)` runs
-the callback twice. On each pass the framebuffer's `active_band_y`
-points to a different 120 row band; `fb_set_px` and `fb_fill_rect`
-silently skip writes outside the active band. The callback uses
-full screen Y coordinates and is idempotent.
+Async DMA ping-pong framebuffer. `fb_frame(compose_callback, ctx)` runs
+the callback 10 times, once per 24-row band. On each pass `active_band_y`
+advances by 24; `fb_set_px` and `fb_fill_rect` silently skip writes
+outside the active band. The callback uses full-screen Y coordinates and
+is idempotent.
 
-Each band buffer is `240 * 120 * 2 = 57600` bytes (one contiguous
-allocation, DMA capable). Allocated once at boot after WiFi init so
-the heap has settled.
+Two DMA-capable buffers alternate: while the SPI DMA ships band N to the
+panel, the CPU composes band N+1 into the other buffer. Each buffer is
+`240 * 24 * 2 = 11520` bytes; total framebuffer RAM is 23040 bytes, down
+from the previous single 57600-byte allocation. Allocated once at boot
+after WiFi init so the heap has settled.
 
 Compose callbacks in `main.c`:
 
@@ -143,9 +145,9 @@ Compose callbacks in `main.c`:
 | compose_prompt        | desktop sent a permission prompt           |
 | compose_persona       | bridge data alive, normal home             |
 | compose_ble_waiting   | BLE paired but no heartbeat yet            |
-| compose_wifi_online   | WiFi up but no BLE peer yet                |
-| compose_setup         | captive portal AP mode                     |
-| compose_connecting    | STA attempting to connect                  |
+| compose_wifi_online   | WiFi online, no BLE peer yet (shows IP)    |
+| compose_setup         | captive portal AP active                   |
+| compose_advertising   | default idle: no BLE peer, WiFi off or STA |
 
 Each home composer ends with `ui_compose_overlay()` so menu / info /
 reset panels layer on top.

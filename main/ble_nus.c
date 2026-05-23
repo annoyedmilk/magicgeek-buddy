@@ -77,6 +77,11 @@ static char    adv_name[20];
 static esp_timer_handle_t s_adv_delay_timer = NULL;
 static volatile bool      s_stale_disconnect = false;
 
+// Deferred encryption-kick timer. Stored here so the previous timer can be
+// stopped and deleted on each new connection instead of leaking one handle
+// per reconnect cycle.
+static esp_timer_handle_t s_sec_kick_timer = NULL;
+
 static void start_advertising(void);  // forward-decl for adv_delay_cb
 
 static void adv_delay_cb(void *arg)
@@ -192,15 +197,21 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             // as "stale bond" - it then sends {"cmd":"unpair"} and
             // drops the link with reason=531. The delay lets the
             // central win the encryption race when it intends to.
-            esp_timer_handle_t t;
+            // Reuse s_sec_kick_timer across connections; stop and delete
+            // any still-running instance before creating a fresh one.
+            if (s_sec_kick_timer != NULL) {
+                esp_timer_stop(s_sec_kick_timer);
+                esp_timer_delete(s_sec_kick_timer);
+                s_sec_kick_timer = NULL;
+            }
             esp_timer_create_args_t a = {
                 .callback = sec_kick_cb,
                 .arg = (void *)(uintptr_t)event->connect.conn_handle,
                 .dispatch_method = ESP_TIMER_TASK,
                 .name = "sec_kick",
             };
-            if (esp_timer_create(&a, &t) == ESP_OK) {
-                esp_timer_start_once(t, 700 * 1000);
+            if (esp_timer_create(&a, &s_sec_kick_timer) == ESP_OK) {
+                esp_timer_start_once(s_sec_kick_timer, 700 * 1000);
             }
         } else {
             ESP_LOGW(TAG, "[ble] connect failed (status=%d) - re-advertising",
