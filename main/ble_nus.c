@@ -71,6 +71,21 @@ static volatile uint16_t link_mtu = 23;   // ATT default until negotiated
 static uint8_t own_addr_type;
 static char    adv_name[20];
 
+// 30 s backoff after a stale-triggered disconnect. Prevents CoreBluetooth
+// from auto-reconnecting via stored LTK before the Hardware Buddy UI has
+// had a chance to notice the link is gone and reset its session state.
+static esp_timer_handle_t s_adv_delay_timer = NULL;
+static volatile bool      s_stale_disconnect = false;
+
+static void start_advertising(void);  // forward-decl for adv_delay_cb
+
+static void adv_delay_cb(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "[ble] stale backoff elapsed - re-advertising");
+    start_advertising();
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 2. RX ring buffer - drained by ble_read() / ble_available()
 // ─────────────────────────────────────────────────────────────────────
@@ -142,8 +157,6 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
 // 4. GAP event handler
 // ─────────────────────────────────────────────────────────────────────
 
-static void start_advertising(void);
-
 // Deferred encryption-initiate callback (esp_timer one-shot, dispatched
 // on the timer task). If the link is still up and NOT yet encrypted,
 // kick the GAP security procedure ourselves. Used to avoid racing the
@@ -203,7 +216,17 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         pending_passkey  = 0;
         tx_subscribed    = false;
         link_mtu         = 23;
-        start_advertising();
+        if (s_stale_disconnect && s_adv_delay_timer != NULL) {
+            // Stale-triggered disconnect: hold off advertising for 30 s so
+            // CoreBluetooth cannot silently auto-reconnect via stored LTK.
+            // The gap forces Hardware Buddy's UI into "Disconnected" state,
+            // giving the user a working Connect button when we re-advertise.
+            s_stale_disconnect = false;
+            esp_timer_start_once(s_adv_delay_timer, 30ULL * 1000 * 1000);
+            ESP_LOGI(TAG, "[ble] stale backoff: re-advertise in 30 s");
+        } else {
+            start_advertising();
+        }
         return 0;
 
     case BLE_GAP_EVENT_ENC_CHANGE:
@@ -410,6 +433,14 @@ void ble_init(const char *name)
     // Persistent bond storage (LTKs, IRKs in NVS namespace nimble_bonds).
     ble_store_config_init();
 
+    // One-shot timer for the stale-disconnect advertising backoff.
+    esp_timer_create_args_t adv_ta = {
+        .callback        = adv_delay_cb,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name            = "adv_delay",
+    };
+    esp_timer_create(&adv_ta, &s_adv_delay_timer);
+
     nimble_port_freertos_init(host_task);
     ESP_LOGI(TAG, "[ble] initialized, will advertise on host sync");
 }
@@ -452,6 +483,11 @@ bool ble_disconnect(void)
     int rc = ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     ESP_LOGI(TAG, "[ble] forced disconnect requested (rc=%d)", rc);
     return rc == 0;
+}
+
+void ble_arm_stale_delay(void)
+{
+    s_stale_disconnect = true;
 }
 
 size_t ble_available(void)

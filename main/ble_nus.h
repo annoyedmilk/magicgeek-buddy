@@ -58,3 +58,10 @@ size_t ble_write(const uint8_t *data, size_t len);
 // teardown gets both sides agreeing again.
 // Returns true if a disconnect was initiated, false if no link was up.
 bool ble_disconnect(void);
+
+// Call before ble_disconnect() when the reason is a stale heartbeat timeout.
+// Arms a 30 s delay before re-advertising so CoreBluetooth cannot instantly
+// auto-reconnect via stored LTK — giving the Hardware Buddy UI time to
+// transition to "Disconnected" and the user a window to reconnect explicitly.
+// No effect on normal (Mac-initiated) disconnects.
+void ble_arm_stale_delay(void);

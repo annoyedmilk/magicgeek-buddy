@@ -501,6 +501,7 @@ static void bridge_task(void *arg)
             // on screen). Disconnecting here would kill the pairing —
             // the passkey screen would vanish before the user can read it.
             if (ble_connected() && ble_secure()) {
+                ble_arm_stale_delay();
                 ESP_LOGW(TAG, "stale + link still up - forcing BLE disconnect");
                 ble_disconnect();
             } else if (ble_connected()) {
