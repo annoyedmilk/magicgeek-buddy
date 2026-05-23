@@ -382,10 +382,15 @@ static void apply_json(const char *line, size_t line_len)
     cJSON *doc = cJSON_ParseWithLength(line, line_len);
     if (!doc) return;
 
-    // 1. Time-sync (top-level "time" array) - no `cmd`, no `evt`.
-    cJSON *time_arr = cJSON_GetObjectItemCaseSensitive(doc, "time");
-    if (cJSON_IsArray(time_arr)) {
-        apply_time_sync(time_arr);
+    // 1. Time-sync: any top-level "time" key means it's not a heartbeat.
+    // Guard on key existence, not cJSON_IsArray: if the desktop sends
+    // {"time": <integer>} (non-array), the array check fails silently
+    // and the message falls through to apply_heartbeat, which sets
+    // connected=true and resets last_updated_ms — a false 45 s reprieve
+    // that creates an exact stale-fire cycle on every reconnect.
+    cJSON *time_item = cJSON_GetObjectItemCaseSensitive(doc, "time");
+    if (time_item) {
+        if (cJSON_IsArray(time_item)) apply_time_sync(time_item);
         cJSON_Delete(doc);
         return;
     }
@@ -419,7 +424,23 @@ static void apply_json(const char *line, size_t line_len)
 
 static void bridge_task(void *arg)
 {
+    bool was_ble_connected = false;
+
     while (1) {
+        // Reset the stale window on every fresh BLE connection so the
+        // desktop gets a clean 45 s slot to send its first heartbeat.
+        // Without this, a reconnect after a long idle period would find
+        // last_updated_ms already > 45 s old and fire the stale ~50 ms
+        // after connect — before the passkey screen has time to show.
+        bool now_ble_connected = ble_connected();
+        if (!was_ble_connected && now_ble_connected) {
+            xSemaphoreTake(g_state_mux, portMAX_DELAY);
+            g_state.last_updated_ms = millis();
+            xSemaphoreGive(g_state_mux);
+            ESP_LOGI(TAG, "BLE reconnect - stale window reset");
+        }
+        was_ble_connected = now_ble_connected;
+
         // Drain everything the BLE stack has buffered. Most heartbeats
         // arrive as several MTU-sized fragments - accumulate until '\n'.
         while (ble_available()) {
@@ -457,7 +478,7 @@ static void bridge_task(void *arg)
             }
         }
 
-        // Mark connection stale after 30s with no heartbeat (per spec).
+        // Mark connection stale after 45s with no heartbeat.
         bool just_went_stale = false;
         xSemaphoreTake(g_state_mux, portMAX_DELAY);
         if (g_state.connected &&
@@ -465,7 +486,7 @@ static void bridge_task(void *arg)
             g_state.connected = false;
             g_state_generation++;
             just_went_stale = true;
-            ESP_LOGW(TAG, "heartbeat stale (>30s) - marked disconnected");
+            ESP_LOGW(TAG, "heartbeat stale (>45s) - marked disconnected");
         }
         xSemaphoreGive(g_state_mux);
         if (just_went_stale) {
@@ -475,9 +496,15 @@ static void bridge_task(void *arg)
             // "Disconnected" but OS still has the GATT handle, Connect
             // button does nothing). Force-tearing down the link from
             // our side gets both stacks to resync from scratch.
-            if (ble_connected()) {
+            // Guard on ble_secure(): if the link is not yet encrypted
+            // the device is in the middle of a pairing exchange (passkey
+            // on screen). Disconnecting here would kill the pairing —
+            // the passkey screen would vanish before the user can read it.
+            if (ble_connected() && ble_secure()) {
                 ESP_LOGW(TAG, "stale + link still up - forcing BLE disconnect");
                 ble_disconnect();
+            } else if (ble_connected()) {
+                ESP_LOGI(TAG, "stale while pairing in progress - skip disconnect");
             }
         }
 
